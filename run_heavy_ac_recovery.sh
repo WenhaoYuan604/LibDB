@@ -22,7 +22,7 @@ Required environment:
   PMEM_BASE=/mnt/pmem0/libdb Parent directory for heavy-test PMEM files.
 
 Optional environment overrides:
-  WORKLOAD_DIR=<repo>/workload
+  WORKLOAD_DIR=<repo>/artifact/ycsb/generated
   WARM_FILE=$WORKLOAD_DIR/warm.txt
   YCSBA_FILE=$WORKLOAD_DIR/ycsba.txt
   YCSBC_FILE=$WORKLOAD_DIR/ycsbc.txt
@@ -72,7 +72,7 @@ fi
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BINARY=${BINARY:-"${SCRIPT_DIR}/build/test"}
 PCI_ADDR=${PCI_ADDR:-}
-WORKLOAD_DIR=${WORKLOAD_DIR:-"${SCRIPT_DIR}/workload"}
+WORKLOAD_DIR=${WORKLOAD_DIR:-"${SCRIPT_DIR}/artifact/ycsb/generated"}
 WARM_FILE=${WARM_FILE:-"${WORKLOAD_DIR}/warm.txt"}
 YCSBA_FILE=${YCSBA_FILE:-"${WORKLOAD_DIR}/ycsba.txt"}
 YCSBC_FILE=${YCSBC_FILE:-"${WORKLOAD_DIR}/ycsbc.txt"}
@@ -118,9 +118,10 @@ if [[ "$TIMEOUT_SECONDS" -gt 0 ]]; then
 fi
 
 [[ -x "$BINARY" ]] || die "LibDB executable not found: $BINARY"
-[[ -f "$WARM_FILE" ]] || die "warm workload not found: $WARM_FILE"
-[[ -f "$YCSBA_FILE" ]] || die "YCSB A workload not found: $YCSBA_FILE"
-[[ -f "$YCSBC_FILE" ]] || die "YCSB C workload not found: $YCSBC_FILE"
+workload_hint="generate workloads with artifact/ycsb/generate_workloads.sh or set WORKLOAD_DIR to an existing workload directory"
+[[ -f "$WARM_FILE" ]] || die "warm workload not found: $WARM_FILE; $workload_hint"
+[[ -f "$YCSBA_FILE" ]] || die "YCSB A workload not found: $YCSBA_FILE; $workload_hint"
+[[ -f "$YCSBC_FILE" ]] || die "YCSB C workload not found: $YCSBC_FILE; $workload_hint"
 
 BINARY=$(realpath "$BINARY")
 WARM_FILE=$(realpath "$WARM_FILE")
