@@ -41,6 +41,10 @@ parameters and line counts of each generated set.
 - Approximately 10 GB for the default text traces and more than 100 GB for the
   temporary 100M-record RocksDB database
 
+The generator first uses the public HTTPS URL. If this server's Git lacks the
+HTTPS transport, it automatically retries the same repository through GitHub
+SSH; `YCSB_REPO_URL` and `YCSB_SSH_REPO_URL` can both be overridden.
+
 ## Generate the paper-scale workloads
 
 Choose a path that does not exist and is safe for the script to create and

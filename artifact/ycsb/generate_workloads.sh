@@ -17,6 +17,7 @@ KEEP_DB=1 is set, removes only that newly created directory on exit.
 Common overrides:
   OUTPUT_DIR=<this-directory>/generated
   YCSB_REPO_URL=https://github.com/haslaboratory/YCSB-tracegen.git
+  YCSB_SSH_REPO_URL=git@github.com:haslaboratory/YCSB-tracegen.git
   YCSB_COMMIT=314c6490956e8deb9f9ee71ee2bd48d1bfd2e510
   YCSB_THREADS=32
   RECORD_COUNT=100000000
@@ -55,6 +56,7 @@ fi
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 YCSB_REPO_URL=${YCSB_REPO_URL:-https://github.com/haslaboratory/YCSB-tracegen.git}
+YCSB_SSH_REPO_URL=${YCSB_SSH_REPO_URL:-git@github.com:haslaboratory/YCSB-tracegen.git}
 YCSB_COMMIT=${YCSB_COMMIT:-314c6490956e8deb9f9ee71ee2bd48d1bfd2e510}
 YCSB_DB_DIR=${YCSB_DB_DIR:-}
 OUTPUT_DIR=${OUTPUT_DIR:-"${SCRIPT_DIR}/generated"}
@@ -129,7 +131,14 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 printf 'Cloning YCSB-tracegen at %s\n' "$YCSB_COMMIT"
-git clone --quiet "$YCSB_REPO_URL" "$SOURCE_DIR"
+effective_repo_url=$YCSB_REPO_URL
+if ! git clone --quiet "$YCSB_REPO_URL" "$SOURCE_DIR"; then
+    [[ -n "$YCSB_SSH_REPO_URL" ]] || die "failed to clone YCSB_REPO_URL"
+    rm -rf -- "$SOURCE_DIR"
+    printf 'HTTPS/local clone failed; retrying with %s\n' "$YCSB_SSH_REPO_URL" >&2
+    git clone --quiet "$YCSB_SSH_REPO_URL" "$SOURCE_DIR"
+    effective_repo_url=$YCSB_SSH_REPO_URL
+fi
 git -C "$SOURCE_DIR" checkout --quiet --detach "$YCSB_COMMIT"
 actual_commit=$(git -C "$SOURCE_DIR" rev-parse HEAD)
 [[ "$actual_commit" == "$YCSB_COMMIT" ]] || die \
@@ -187,7 +196,7 @@ run_trace run "${SCRIPT_DIR}/workloads/workloade.properties" \
     cd "$OUTPUT_DIR"
     sha256sum warm.txt ycsba.txt ycsbc.txt ycsbe.txt > SHA256SUMS
     {
-        printf 'ycsb_repository=%s\n' "$YCSB_REPO_URL"
+        printf 'ycsb_repository=%s\n' "$effective_repo_url"
         printf 'ycsb_commit=%s\n' "$YCSB_COMMIT"
         printf 'threads=%s\n' "$YCSB_THREADS"
         printf 'record_count=%s\n' "$RECORD_COUNT"
