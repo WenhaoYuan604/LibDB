@@ -114,7 +114,6 @@ struct subspace_info * dram_index_search(struct dram_index * hybrid_index , key_
     }
     struct dram_index_node * node = hybrid_index->head;
     while(1){
-        // printf("0000\n");
         key_type * pivot = upper_bound(node->key_child + 1, node->key_child + node->nchild, key) - 1;
         size_t index = pivot - node->key_child;
 
@@ -136,7 +135,6 @@ struct subspace_info * dram_index_search(struct dram_index * hybrid_index , key_
 struct dram_index * dram_index_initialize(key_type *subspace_array , int size){
     struct dram_index * dram_index = (struct dram_index *)malloc(sizeof(struct dram_index));
     dram_index->head = make_leaf(NULL);
-    // printf("size is %d\n" , size);
     for(int i = 0 ; i < size ; i++ ){
         struct subspace_info * subspace = subspace_info_initialize();
         dram_index_insert( dram_index , subspace_array[i] , subspace , NULL);

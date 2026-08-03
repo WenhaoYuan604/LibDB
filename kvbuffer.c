@@ -38,7 +38,6 @@ PMEMobjpool * write_buffer_file_new(int file_seq){
     }
     metadata = (struct write_buffer_file_root *)pmemobj_direct(root);
     metadata->segment_num = 0;
-    // pmemobj_memset_persist(pool , metadata , 0 , sizeof(struct write_buffer_file_root));
     pmemobj_persist(pool , metadata , sizeof(metadata));
     return pool;
 }
@@ -112,9 +111,7 @@ int write_buffer_segement_new(struct write_buffer * write_buffer , int size , st
     }
     struct write_buffer_free_node * node = (struct write_buffer_free_node *)malloc(sizeof(struct write_buffer_free_node));
     if(pmemobj_alloc(pool, &node->buffer , WSB_SIZE , 0 , 0 , 0)){
-        // printf("failed to alloc memory for WBS\ncreate new WBF\n");
         printf("write_buffer_file_%d no free space , consists of %d WBSs\n" , write_buffer->file_num-1 , ((struct write_buffer_file_root *)pmemobj_direct(pmemobj_root(pool , sizeof(struct write_buffer_file_root))))->segment_num);
-        // printf("WBF num is %d\ncurr WBF consists of %d WBSs\n" , write_buffer->file_num,((struct write_buffer_file_root *)pmemobj_direct(pmemobj_root(pool , sizeof(struct write_buffer_file_root))))->segment_num);
         printf("create write_buffer_file_%d\n" , write_buffer->file_num);
         write_buffer->pool[write_buffer->file_num] = write_buffer_file_new(write_buffer->file_num);
         if(write_buffer->pool[write_buffer->file_num] == NULL){
@@ -128,9 +125,6 @@ int write_buffer_segement_new(struct write_buffer * write_buffer , int size , st
         return write_buffer_segement_new(write_buffer , size , free_list_head);
     }
 
-    // char * str = (char *)pmemobj_direct(node->buffer);
-    // pmemobj_memset_persist(pool , str , 0 , WSB_SIZE);
-    //
     //WBS创建成功
     if(node->buffer.off % LNF_SLOT_MIN_SIZE != 0){
         node->buffer.off = (node->buffer.off / LNF_SLOT_MIN_SIZE) * LNF_SLOT_MIN_SIZE;
@@ -140,22 +134,16 @@ int write_buffer_segement_new(struct write_buffer * write_buffer , int size , st
          node->num = WSB_SIZE / q_size;
     }
     /*修改metadata*/
-    // metadata->segment_element_size[metadata->segment_num] = q_size;
-    // metadata->segment[metadata->segment_num] = node->buffer;
     metadata->segment_element_size[metadata->segment_num] = q_size;
     metadata->segment[metadata->segment_num] = node->buffer;
     pmem_persist(&metadata->segment_element_size[metadata->segment_num] , sizeof(q_size));
     pmem_persist(&metadata->segment[metadata->segment_num] , sizeof(PMEMoid));
 
-    // pmemobj_memcpy_persist(pool , &metadata->segment_element_size[metadata->segment_num] , &q_size , sizeof(int));
-    // pmemobj_memcpy_persist(pool , &metadata->segment[metadata->segment_num] , &node->buffer , sizeof(PMEMoid));
 
     metadata->segment_num ++;
     pmem_persist(&metadata->segment_num, sizeof(short));
-    // pmemobj_persist(pool , &metadata->segment_num , sizeof(short));
     pthread_mutex_unlock(&g_mutex_lock_wbs);
     /*修改free_node*/
-    // node->num = WSB_SIZE / q_size;
     node->size = q_size;
     node->next = *free_list_head;
     node->WBF_seq = write_buffer->file_num - 1;
@@ -168,7 +156,6 @@ struct write_buffer_free_node ** free_list_head , PMEMobjpool ** pool){
     struct write_buffer_free_node * pre_node = NULL;
     struct write_buffer_free_node * node = *free_list_head;
     PMEMoid id = OID_NULL;
-    // printf("write_buffer_get_free_node start\n");
     while(node != NULL){
         if(node->size >= size && (node->size / 2) < size){//
             break;
@@ -178,7 +165,6 @@ struct write_buffer_free_node ** free_list_head , PMEMobjpool ** pool){
             node = node->next;
         }
     }
-    // printf("loop done\n");
     if(node == NULL){//没有合适size的空闲结点
         if( write_buffer_segement_new(write_buffer , size , free_list_head) ){
             node = *free_list_head;
@@ -198,7 +184,6 @@ struct write_buffer_free_node ** free_list_head , PMEMobjpool ** pool){
     node->buffer.off += node->size;
     *pool = write_buffer->pool[node->WBF_seq];
     *WBF_seq = node->WBF_seq;
-    // printf("node->buffer.off is %lu node->size is %d\n" , node->buffer.off , node->size);
     if(node->num == 0){
         if(pre_node == NULL){
             *free_list_head = node->next;
@@ -239,33 +224,7 @@ PMEMoid write_buffer_insert(key_type key, kv_version_type version,
         exit(EXIT_FAILURE);
     }
 
-    // end[thread->thread] = spdk_get_ticks();
-    // if(end[thread->thread] > start[thread->thread]){
-    //     total[thread->thread] += (end[thread->thread] - start[thread->thread]);
-    //     // printf("end2 - start is %u\n" , end2 - start);
-    // }
-    // else{
-    //     total[thread->thread] += (end[thread->thread] + g_ticks - start[thread->thread]);
-    //     // printf("end2 is %u , start is %u  ,ticks is %u\n" , end , start , g_ticks);
-    //     // printf("end2 + g_ticks - start %u\n" , end + g_ticks - start);
-    // }
-
-    // else{
-    // printf("write buffer get free node %lu %lu pool %p\n", id.pool_uuid_lo , id.off , pool);
-    // }
-
     char * dest = (char *)pmemobj_direct(id);
-
-    // end[thread] = spdk_get_ticks();
-    // if(end[thread] > start[thread]){
-    //     total[thread] += (end[thread] - start[thread]);
-    //     // printf("end2 - start is %u\n" , end2 - start);
-    // }
-    // else{
-    //     total[thread] += (end[thread] + g_ticks - start[thread]);
-    //     // printf("end2 is %u , start is %u  ,ticks is %u\n" , end , start , g_ticks);
-    //     // printf("end2 + g_ticks - start %u\n" , end + g_ticks - start);
-    // }
     access_nvm();
     if(kv_record_encode(dest, (size_t)size, key, version,
                         value, (size_t)value_size) != 0){

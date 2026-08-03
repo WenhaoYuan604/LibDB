@@ -16,7 +16,6 @@ skipnode * head) {
 
     node->length = length;
     node->head = head;
-    // node->value = strdup(value);
     node->level = level;
     node->forward = (skipnode**)malloc(level * sizeof(skipnode*));
     node->lru_prev = node->lru_next = NULL;
@@ -201,20 +200,6 @@ int length, int thread) {
     }
 }
 
-// 释放缓存
-// void kvcache_free(kvcache *cache) {
-//     skipnode *curr = cache->lru_head;
-//     while (curr) {
-//         skipnode *next = curr->lru_next;
-//         free(curr->value);
-//         free(curr->forward);
-//         free(curr);
-//         curr = next;
-//     }
-//     free(cache->head->forward);
-//     free(cache->head);
-//     free(cache);
-// }
 
 uint64_t kvcache_get_batch(kvcache *cache, lru_list *list, key_type *keys, char **values
 , int *value_size, int num_keys, int *cache_hits , int * buffer_hits) {

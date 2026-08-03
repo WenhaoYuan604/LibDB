@@ -78,7 +78,6 @@ static int leaf_node_file_validate(PMEMobjpool *pool, uint32_t file_seq){
 }
 
 int leaf_node_segement_new(struct nvm_index * nvm_index  , struct nvm_index_free_node ** free_list_head){
-    // printf("leaf_node_segement_new start\n");
     pthread_mutex_lock(&g_mutex_lock_lns);
 
     struct nvm_index_free_node * node = (struct nvm_index_free_node *)malloc(sizeof(struct nvm_index_free_node));
@@ -142,35 +141,21 @@ int leaf_node_segement_new(struct nvm_index * nvm_index  , struct nvm_index_free
         nvm_index->file_num++;
         fprintf(stdout, "created leaf_node_file%u\n", nvm_index->file_num - 1);
     }
-    // printf("pool is %p ,buffer.pool_uuid_lo is %lu buffer.off is %lu\n" ,pool , node->buffer.pool_uuid_lo , node->buffer.off);
-    // char * str = (char *)pmemobj_direct(node->buffer);
-    // pmemobj_memset_persist(pool , str , 0 , LNS_SIZE);
-//
     if(node->buffer.off % LNF_SLOT_MIN_SIZE != 0){
         node->buffer.off += LNF_SLOT_MIN_SIZE - (node->buffer.off % LNF_SLOT_MIN_SIZE);
     }
     node->num = LNS_SIZE / LNF_SLOT_MIN_SIZE;
-    // printf("1\n");
     //WBS创建成功
     /*修改metadata*/
-    // metadata->segment_element_size[metadata->segment_num] = q_size;
-    // metadata->segment[metadata->segment_num] = node->buffer;
-    // pmemobj_memcpy_persist(pool , &metadata->segment[metadata->segment_num] , &node->buffer , sizeof(PMEMoid));
     metadata->segment[metadata->segment_num] = node->buffer;
     pmem_persist(&metadata->segment[metadata->segment_num] , sizeof(PMEMoid));
-    // printf("2\n");
     metadata->segment_num ++;
-    // printf("3\n");
     pmem_persist(&metadata->segment_num , sizeof(short));
-    // pmemobj_persist(pool , &metadata->segment_num , sizeof(short));
-    // printf("pmemobj_persist done\n");
     /*修改free_node*/
     pthread_mutex_unlock(&g_mutex_lock_lns);
-    // node->num = LNS_SIZE / LNF_SLOT_MIN_SIZE;
     node->next = *free_list_head;
     node->LNF_seq = (uint16_t)pool_seq;
     *free_list_head = node;
-    // printf("leaf_node_segement_new done\n");
     return 1;
 }
 
@@ -179,8 +164,6 @@ PMEMoid nvm_index_get_free_node(struct nvm_index * nvm_index ,struct nvm_index_f
     struct nvm_index_free_node * pre_node = NULL;
     struct nvm_index_free_node * node = *free_list_head;
     PMEMoid id = OID_NULL;
-    // printf("nvm_index_get_free_node start\n");
-    // printf("loop done\n");
     if(node == NULL){//没有合适size的空闲结点
         if( leaf_node_segement_new(nvm_index , free_list_head) ){
             node = *free_list_head;
@@ -191,15 +174,10 @@ PMEMoid nvm_index_get_free_node(struct nvm_index * nvm_index ,struct nvm_index_f
         printf("node is still NULL\n");
         return OID_NULL;
     }
-    // else{
-    //     printf("leaf node new segement created\n");
-    // }
     id = node->buffer;
     node->buffer.off += LNF_SLOT_MIN_SIZE;
     node->num -- ;
     *pool = nvm_index->pool[node->LNF_seq];
-    // printf("node->LNF_seq is %d\n" , node->LNF_seq);
-    // printf("para done\n");
     if(node->num == 0){
         if(pre_node == NULL){
             *free_list_head = node->next;

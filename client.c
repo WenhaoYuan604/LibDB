@@ -23,7 +23,6 @@ uint64_t ssd_block_space_consumed = 0;
 
 
 void insert_breakdown_output(struct db * db){
-    // double time;
     uint64_t ticks_hz = spdk_get_ticks_hz();
     double total_buffer_insert_time = 0;
     double total_index_insert_time = 0;
@@ -206,7 +205,6 @@ void client_output_bw(struct db * db){
 
     ssd_block_space_consumed += (total_flush_block + total_gc_write_block + total_split_block_write - (total_gc_block - total_gc_write_block) -
      (total_split_block - total_split_block_write));
-    // ssd_block_space_consumed += ((total_block - total_gc_block - total_split_block) + total_gc_write_block + total_split_block_write - );
 
     fprintf(db->output_fp ,"total bandwidth consumed : block %lu consume %luMB\n" , total_block ,  total_block * BLOCK_SIZE /  1024 / 1024);
 
@@ -250,112 +248,12 @@ void client_output_bw(struct db * db){
     memset(thread_gc_block_rw , 0 , sizeof(uint64_t) * db->thread);
     memset(thread_gc_block_write , 0 , sizeof(uint64_t) * db->thread);
 
-    // insert_breakdown_output(db);
-    // read_breakdown_output(db);
 
     return ;
 }
 
 
 
-// void db_request_filling(struct db *db, int request_size, struct user_rq *request) {
-//     int i, thread;
-//     struct request req;
-//     int * filling_num = (int *)malloc(sizeof(int) * db->thread);
-//     memset(filling_num , 0 , sizeof(int) * db->thread);
-//     // struct request * request_p = db->ring[thread]->ring;
-
-//     // 添加变量来记录各类请求的数量
-//     int read_count = 0;
-//     int write_count = 0;
-//     int scan_count = 0;
-//     struct scan_kv * scan_result;
-
-//     for (i = 0; i < request_size; i++) {
-//         req.key = request[i].key;
-//         req.type = request[i].type;
-//         if(req.type == 0){//read
-//             read_count++;
-//         }
-//         else if(req.type == 1){//write
-//             write_count++;
-//             req.size = request[i].size;
-//             req.value = (char *)malloc(req.size);
-//             if (req.value == NULL) {
-//                 printf("Memory allocation failed for key %lu\n", req.key);
-//                 benchmark_completed = 1;
-//                 exit(EXIT_FAILURE);
-//             }
-//             client_key_to_value(req.key, req.value, req.size);
-//         }
-//         else if(req.type == 2){//scan
-
-//             // pthread_mutex_lock(&scan_mutex);
-//             if (pending_scan_count < MAX_PENDING_SCANS) {
-//                 pending_scans[pending_scan_count].key = req.key;
-//                 pending_scans[pending_scan_count].scan_length = request[i].size;
-//                 pending_scans[pending_scan_count].submit_time = spdk_get_ticks();
-//                 pending_scans[pending_scan_count].completed = false;
-//                 pending_scans[pending_scan_count].thread_id = key_to_thread(req.key, db);
-//                 pending_scan_count++;
-//             }
-//             // pthread_mutex_unlock(&scan_mutex);
-
-
-//             scan_count++;
-//             req.value = (char *)malloc(sizeof(struct scan_kv));
-//             req.size = request[i].size;
-//             if (req.value == NULL) {
-//                 printf("Memory allocation failed for key %lu\n", req.key);
-//                 benchmark_completed = 1;
-//                 exit(EXIT_FAILURE);
-//             }
-//             scan_result = (struct scan_kv *)req.value;
-//             scan_result->key = (key_type *)malloc(sizeof(key_type) * request[i].size);
-//             scan_result->value = (char **)malloc(sizeof(char *) * request[i].size);
-//             scan_result->value_size = (int *)malloc(sizeof(int) *request[i].size);
-
-//             if(scan_result->value == NULL || scan_result->key == NULL || scan_result->value_size == NULL){
-//                 printf("Memory allocation failed for key %lu\n", req.key);
-//                 benchmark_completed = 1;
-//                 exit(EXIT_FAILURE);
-//             }
-//         }
-
-//         thread = key_to_thread(req.key, db);
-//         // printf("thread is %d , req key value size is %lu %s %d\n" ,thread ,  req.key , req.value , req.size);
-//         // if(req.key == 6063691547004636268){
-//         //     printf("key: %lu thread %d\n" , req.key , thread);
-//         // }
-//         if (thread < 0 || thread >= db->thread) {
-//             printf("Invalid thread %d for key %lu\n", thread, req.key);
-//             benchmark_completed = 1;
-//             exit(EXIT_FAILURE);
-//         }
-//         db->ring[thread]->ring[(db->ring[thread]->server_ring_tail + filling_num[thread]) % db->server_ring_size ] = req;
-
-
-//         // memcpy(&db->ring[thread]->ring[db->ring[thread]->server_ring_head + i] , &req , sizeof(struct request));
-//         // printf("thread is %d\n" , thread);
-//         // printf("submit key %d, value %s ,db->server_ring_size%d\n", req.key, req.value ,db->server_ring_size);
-
-//         thread_submitted[thread] ++;
-//         filling_num[thread] ++;
-//         // printf("submit thread %d key %d completed is %d\n" , thread , req.key , completed);
-//         // printf("requst_p->type is %d\n" , db->ring[thread]->ring[i].type);
-
-//     }
-
-//     // 在提交请求之前输出各类请求的统计信息
-//     printf("请求统计: 总计 %d 请求 (读取: %d, 写入: %d, 扫描: %d)\n",
-//            request_size, read_count, write_count, scan_count);
-
-//     client_submit_batched_request(db , filling_num);
-//     free(filling_num);
-//     return;
-// }
-
-//
 
 int test_get_num = 0;
 int test_insert_num = 0;
@@ -382,23 +280,16 @@ void load_injector_pooling_completion(struct result ** result , int result_num ,
         }
         else if(result[i]->type == 2){//scan
             scan_result = (struct scan_kv *)result[i]->value;
-            // printf("result[%d]->size is %d scan_result keu num is %d\n" , i , result[i]->size, scan_result->key_num);
             for(int j = 0 ; j < result[i]->size ; j++){
                 if(scan_result->value[j] == NULL){
                     printf("scan_result->value %d is NULL\n" , j);
                     return ;
                 }
-                // printf("scan_result %d key is %lu value is %s\n" ,j ,scan_result->key[j],  scan_result->value[j]);
                 free(scan_result->value[j]);
-                // printf("free done\n");
             }
-            // printf("start to free scan_result->value_size %p\n" , scan_result->value_size );
             free(scan_result->value_size);
-            // printf("start to free scan_result->value %p\n" , scan_result->value );
             free(scan_result->value);
-            // printf("start to free scan_result->key %p\n" , scan_result->key );
             free(scan_result->key);
-            // printf("start to free scan_result %p\n" , scan_result );
             free(scan_result);
         }
         free(result[i]);
@@ -425,19 +316,9 @@ void client_polling_completed(struct db * db , int polling_num){
         // 检查是否已经过了5秒
         current_time = spdk_get_ticks();
         if (current_time - last_report_time > five_seconds_ticks) {
-            // completed = 0;
-            // for(int i = 0 ; i < db->thread ; i++){
-            //     completed += thread_completed[i];
-            // }
             printf("已完成 %lu 个请求 \n", completed);
             fflush(stdout);
-            // for(int i = 0 ; i < db->thread ; i++){
-            //     printf("thread %d scan key is %lu\n" , i , thread_scan_key[i]);
-            // }
-            // printf("已完成 %d 个请求，总共 %d 个请求（读取: %d, 写入: %d, 扫描: %d)\n",
-            //       completed, request_size, read_completed, write_completed, scan_completed);
             last_report_time = current_time;
-            // last_report_time = current_time;
         }
     }
 }
@@ -463,7 +344,6 @@ void load_executor(void * arg){
     pthread_barrier_wait(&barrier);
     printf("load_injector %d start to work\n" , load_injector->thread);
     fflush(stdout);
-    // sleep(100);
     while((request < load_injector->load_num) || !test_completed){
         if(request < load_injector->load_num){
             req = (struct request *)malloc(sizeof(struct request));
@@ -471,8 +351,6 @@ void load_executor(void * arg){
             req->type = test[request].type;
             req->size = test[request].size;
             if(req->type == 0){
-                // req->break_down = (void *)malloc(sizeof(struct read_time_breakdown));
-                // memset(req->break_down , 0 , sizeof(struct read_time_breakdown));
                 read_count ++;
             }
             else if(req->type == 1){
@@ -522,13 +400,11 @@ void load_executor(void * arg){
         }
         result_num = spdk_ring_dequeue(load_injector->spdk_result_ring, (void **)result , 10);
         load_injector_pooling_completion(result , result_num , load_injector->thread);
-        // printf("result num is %d\n" , result_num);
         load_injector_completed[load_injector->thread] += result_num;
     }
 
     pthread_barrier_wait(&barrier_complete);
     printf("load_injector[%d] completed %lu\n" ,load_injector->thread, load_injector_completed[load_injector->thread]);
-    // spdk_app_stop(0);
     fflush(stdout);
 }
 
@@ -549,7 +425,6 @@ void client_initialize_load_injectors(struct db * db , struct user_rq * load, in
         load_injectors[i].spdk_ring = db->spdk_ring;
         load_injectors[i].thread = i;
         load_injectors[i].core = i + db->thread + 1;
-        // load_injectors[i].core = ((i + db->thread + 1) * 4 + 0) % 80 ;
         load_injectors[i].load_array = (struct user_req * )load;
         load_injectors[i].load_num = load_num;
         load_injectors[i].nb_load_injectors = db->load_injectors;
@@ -567,8 +442,6 @@ void client_initialize_load_injectors(struct db * db , struct user_rq * load, in
 
     pthread_barrier_wait(&barrier);
     start = spdk_get_ticks();
-    // printf("client start to client_polling_completed\n");
-    // fflush(stdout);
     client_polling_completed(db , load_num);
     end = spdk_get_ticks();
     printf("load done\n");
@@ -656,17 +529,6 @@ void client_executor(struct db * db){
     fflush(db->output_fp);
 
 
-    // test = client_read_request(test_path , &test_num , db->size_value);
-
-    // pthread_barrier_wait(&barrier);
-    // // sleep(100);
-    // start = spdk_get_ticks();
-    // printf("client start to client_polling_completed\n");
-    // client_polling_completed(db , test_num);
-    // end = spdk_get_ticks();
-    // printf("load done\n");
-    // time = (double)(end - start) / ticks;
-    // client_output_bw(db);
     benchmark_completed = 1;
 
     EXIT_SUCCESS ;
@@ -699,7 +561,6 @@ struct user_rq * client_read_request(char * file  , int * num , int kvsize){
             break;
         }
 
-        // printf("s is %s user is %d\n" , s , user);
         request[i].key = user;
         request[i].size = kvsize;
         if(strcmp(s , "I") == 0 || strcmp(s , "U") == 0){
@@ -729,7 +590,6 @@ struct user_rq * client_read_request(char * file  , int * num , int kvsize){
         }
         else {
         }
-        // printf("request type is %d , key is %d\n" , request[i].type , request[i].key);
         i++;
         /**/
         if( i >= array_size){

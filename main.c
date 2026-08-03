@@ -325,8 +325,6 @@ int main( int argc, char *argv[] ){
         fprintf(stderr, "初始化失败（%s）\n", db->recovery_mode ? "recovery" : "正常路径");
         return EXIT_FAILURE;
     }
-    // client_initialize(db);
-    // printf("SLOT_MAX_ELEMENT is %d sizeof(struct slot_element) is %d\n" , SLOT_MAX_ELEMENT , sizeof(struct slot_element));
     main_core = spdk_env_get_current_core();//main_core = 0;
     printf("main_core is %d\n" , main_core);
     fflush(stdout);
@@ -352,7 +350,6 @@ int main( int argc, char *argv[] ){
     printf("start client thread\n");
     client_executor(db);
 
-    // fprintf(db->output_fp , "consume SSD" , db-
     fflush(db->output_fp);
     benchmark_completed = 1;
     return 0;

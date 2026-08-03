@@ -71,12 +71,10 @@ void histogram_init(int thread_num){
         g_his_data[i] = spdk_histogram_data_alloc();
     }
 	 g_his_data_compact =  spdk_histogram_data_alloc();
-    // g_his_data = spdk_histogram_data_alloc();
     g_tsc_rate = spdk_get_ticks_hz();
 }
 
 void histogram_reset_all(int thread_num){
-    // assert(g_his_data!=NULL);
     for(int i = 0 ; i < thread_num ; i ++){
         spdk_histogram_data_reset(g_his_data[i]);
     }
@@ -84,7 +82,6 @@ void histogram_reset_all(int thread_num){
 }
 
 void histogram_update(int thread , uint64_t data){
-    // assert(g_his_data!=NULL);
     spdk_histogram_data_tally(g_his_data[thread],data);
 }
 

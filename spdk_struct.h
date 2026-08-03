@@ -1,7 +1,6 @@
 #ifndef SPDK_STRUCT_H_
 #define SPDK_STRUCT_H_
 
-// #include "subspace.h"
 #include "spdk/stdinc.h"
 #include "spdk/nvme.h"
 #include "spdk/vmd.h"
@@ -11,7 +10,6 @@
 #include "spdk/log.h"
 #include <string.h>
 #include "base.h"
-// #include "./nvme_pipe.h"
 
 struct segment{
 	struct segment * next;
@@ -45,16 +43,7 @@ struct task{
     key_type key;
     int is_completed;
 	struct address_type addr;
-    // int block_seq;
-    // int block;
-    // int off;
-	// int head_to_free_seq;
-
-    // struct result_ring * ring;
     char * buffer;//要写入的数据和要读到的数据保存的地址
-    // char * buffer_to_be_filled;//读到的数据要写入的kvcache的地址
-    // int * to_be_filled;
-    // int * to_be_filled_num;
     struct task * next_free;
     struct ns_entry * ns_entry;
 
@@ -80,8 +69,6 @@ struct task{
 	int * valid_key_per_subspace;
 
 
-	// int total_block_to_read;
-	// int block_read;
 	int total_block_num;
 	int block_completed;
 	uint32_t * block_array;
@@ -111,7 +98,6 @@ struct ns_entry {
 
 static TAILQ_HEAD(, ctrlr_entry) g_controllers = TAILQ_HEAD_INITIALIZER(g_controllers);
 static TAILQ_HEAD(, ns_entry) g_namespaces = TAILQ_HEAD_INITIALIZER(g_namespaces);
-// static u_int64_t g_blocknum;
 
 int add_trid(const char *trid_str);
 

@@ -12,7 +12,6 @@ struct pending_scan_request {
 };
 //若tail = head表示空，若head = tail+1表示满
 
-// #define REQUEST_SIZE value_size + 8
 
 void client_initialize(struct db * db);
 

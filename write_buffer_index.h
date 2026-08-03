@@ -4,7 +4,6 @@
 #include "./base.h"
 /* 不可 #include subspace.h：会与 subspace.h 互相包含，导致 subspace_info 未定义即被使用 */
 struct subspace_info;
-// #include "./kvbuffer.h"
 
 struct write_buffer_return_type{
     PMEMoid id;
@@ -13,14 +12,6 @@ struct write_buffer_return_type{
 };
 
 
-// struct write_buffer_index_node {
-
-//     key_type key;
-//     uint16_t size;
-//     PMEMoid id;
-//     uint8_t WBF_seq;
-//     struct write_buffer_index_node **forward;
-// };
 
 
 struct write_buffer_index_node {
@@ -38,8 +29,6 @@ struct write_buffer_index {
 
     /*next和prev的作用是记录刷写的多个write_buffer_list*/
     /*head_to_free的每个元素记录一次flush的头结点*/
-    // struct write_buffer_index_node * head_to_free[8];
-    // int num;
     size_t levels;
     size_t reserve_levels;
 };
@@ -74,9 +63,7 @@ struct write_buffer_index * write_buffer_copy (struct write_buffer_index * buffe
  key_type last_insert , int thread);
 
  void write_buffer_index_check(struct subspace_info * subspace_info);
-// void write_buffer_index_update_before_flush(struct write_buffer_index * write_buffer_index , key_type last_insert );
 
-// void  write_buffer_index_update_after_flush(struct write_buffer_index * write_buffer_index , key_type last_insert);
 
 #ifdef __cplusplus
 }

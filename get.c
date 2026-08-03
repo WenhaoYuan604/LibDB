@@ -46,10 +46,7 @@ struct spdk_ring * spdk_result_ring , uint64_t start , void * break_down){
     result->end = spdk_get_ticks();
     result->break_down = break_down;
     while(!spdk_ring_enqueue(spdk_result_ring , (void **)&result ,1 , NULL)){
-        // printf("spdk_result_ring is full\n");
-        // sleep(100);
     }
-    // printf("server_submit_result done\n");
     return ;
 }
 
@@ -100,9 +97,7 @@ struct read_time_breakdown * break_down){
     uint64_t start , end;
 
 
-    // start = spdk_get_ticks();
     subspace_info = dram_index_search(thread->index->dram_index , key , NULL , NULL);
-    // end = spdk_get_ticks();
 
     index = subspace_info->buffer_index;
     while(index){
@@ -139,38 +134,21 @@ struct read_time_breakdown * break_down){
                 exit(EXIT_FAILURE);
             }
             access_nvm_release();
-            // kvcache_insert(subspace_info->kvcache , thread->lru_list , key , result , *size_o , thread->thread);
-            // kvcache_insert_emulation(subspace_info->kvcache , thread->lru_list , key , result , *size_o , thread->thread);
-            // int key_sz = *(uint16_t*)pmemobj_direct(node.id);
-            // *size_o = node.size - 2 - key_sz - 2 - 8;
-            // memcpy(result , pmemobj_direct(node.id) + 2 + key_sz + 2 , *size_o);
-            // printf("get key %d on PM done\n" , key);
-            // end = spdk_get_ticks();
-            // read_breakdown[thread->thread].write_buffer_index_time += end - start;
             return result;
         }
         else{
             index = index->next;
         }
     }
-    // end = spdk_get_ticks();
-    // read_breakdown[thread->thread].write_buffer_index_time += end - start;
 
-    // start = spdk_get_ticks();
     cache_value = kvcache_get(subspace_info->kvcache ,thread->lru_list ,  key , &length);
 
-    // cache_value = kvcache_get_emulation(subspace_info->kvcache ,thread->lru_list ,  key , &length,thread->thread);
     if(cache_value != NULL){//kvcache命中
         thread_kvcache_hit[thread->thread]++;
         *size_o = length;
-        // end = spdk_get_ticks();
-        // read_breakdown[thread->thread].search_cache_time += end - start;
         return cache_value;
     }
-    // end = spdk_get_ticks();
-    // read_breakdown[thread->thread].search_cache_time += end - start;
 
-    // start = spdk_get_ticks();
     if(node == NULL && cache_value == NULL){//不存在于write buffer
         addr = nvm_index_search(subspace_info , key);
         if(ADDR_IS_NULL(addr)){//不存在
@@ -187,7 +165,6 @@ struct read_time_breakdown * break_down){
             int qpair_excuting_once , rc ;
             int qpair_num = thread->thread % ctr_max_qp;
 
-            // qpair_lock(thread->thread , 2);
             task = get_free_task(thread->ns_entry , thread->thread);
 
             while(task == NULL){//qpair已满
@@ -212,14 +189,11 @@ struct read_time_breakdown * break_down){
                 physical_block_to_logical_block, get_cb , task , 0);
             if (rc != 0) {
                 printf("ERROR:starting read I/O failed\n");
-                // qpair_unlock(thread->thread);
                 return 0;
             }
             *size_o = addr.size;
         }
     }
-    // end = spdk_get_ticks();
-    // read_breakdown[thread->thread].nvm_index_time += end - start;
     return NULL;
 }
 

@@ -6,7 +6,6 @@
 
 struct leaf_node_file_root{
     PMEMoid segment[LNS_NUM_MAX];
-    // uint16_t segment_element_size[LNS_NUM_MAX];
     uint16_t segment_num;
 };
 
@@ -31,13 +30,6 @@ int nvm_index_reserve_free_nodes(struct nvm_index *nvm_index,
                                  struct nvm_index_free_node **free_list_head,
                                  uint32_t required);
 
-// char * leaf_node_file_str(int file_seq);
-
-// PMEMobjpool * leaf_node_file_new(int file_seq);
-
-// struct nvm_index * nvm_index_initialize();
-
-// struct subspace_info * nvm_index_insert(struct subspace_info * subspace_info ,PMEMoid id , key_type key, int size);
 
 
 #endif

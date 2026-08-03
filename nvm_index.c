@@ -6,93 +6,6 @@
 #include "write_buffer_index.h"
 #include <errno.h>
 #include <libpmemobj/base.h>
-// void nvm_index_persist_out_of_place(struct subspace_info * subspace_info ,struct slot_element * slot_array,
-//  int slot_array_size , struct nvm_index * nvm_index , struct nvm_index_free_node ** free_list_head , int slot_start){
-//     int i = 0;
-//     PMEMoid id;
-//     PMEMobjpool * pool;
-//     char * dest;
-//     // struct
-//     while( i * SLOT_MAX_ELEMENT < slot_array_size){
-//         id = nvm_index_get_free_node(nvm_index ,free_list_head , &pool);
-//         dest = (char *)pmemobj_direct(id);
-//         pmemobj_memcpy_persist(pool , dest , &slot_array[i * SLOT_MAX_ELEMENT] ,
-//             SLOT_MAX_ELEMENT * sizeof(struct slot_element));
-
-//         subspace_info->slot_key_num[i + slot_start] = SLOT_MAX_ELEMENT > (slot_array_size - i * SLOT_MAX_ELEMENT) ?
-//             (slot_array_size - i * SLOT_MAX_ELEMENT) : SLOT_MAX_ELEMENT;
-//         subspace_info->min_key[i + slot_start] = slot_array[i * SLOT_MAX_ELEMENT].key;
-//         subspace_info->slot[i + slot_start] = id;
-//         subspace_info->pool[i + slot_start] = pool;
-//         // subspace_info->slot_key_num = (slot_array_size - i * SLOT_MAX_ELEMENT);
-//     }
-//     return ;
-// }
-
-// /*返回merge后的有效键值对的个数*/
-// /*merge_sort*/
-// int nvm_index_merge_sort_out_of_place(struct subspace_info * subspace_info , int slot_start , key_type * key ,
-//  struct address_type * addr , int array_size , struct nvm_index * nvm_index , struct nvm_index_free_node ** free_list_head){
-//     struct slot_element slot_array [SLOT_MAX_ELEMENT *(SUBSPACE_MAX_SLOT + 5)];
-//     struct slot_element * slot_element;
-//     int i , j , k , p;
-//     j = k = p = 0;
-//     /*j是key数组的下标
-//     k是slot_element的下标
-//     p是slot_array的下标*/
-//     /*merge_sort*/
-//     for(i = slot_start ; i < subspace_info->slot_num ; i++){
-//         slot_element = (struct slot_element *)pmemobj_direct(subspace_info->slot[i]);
-//         k = 0;
-//         while(k < subspace_info->slot_key_num[i] && j < array_size){
-//             if(key[j] > slot_element[k].key){
-//                 slot_array[p] = slot_element[k];
-//                 p++;
-//                 k++;
-//             }
-//             else if(key[j] < slot_element[k].key){
-//                 slot_array[p].key = key[j];
-//                 slot_array[p].addr = addr[j];
-//                 j++;
-//                 p++;
-//             }
-//             else{
-//                 slot_array[p].key = key[j];
-//                 slot_array[p].addr = addr[j];
-//                 j++;
-//                 k++;
-//                 p++;
-//             }
-//             if( j>= array_size){
-//                 break;
-//             }
-//         }
-//         if( j>= array_size){
-//                 break;
-//         }
-//     }
-//     if(j >= array_size){//key数组里的已经全部写入
-//         for(i = slot_start ; i < subspace_info->slot_num ; i++){
-//             slot_element = (struct slot_element *)pmemobj_direct(subspace_info->slot[i]);
-//             while(k < subspace_info->slot_key_num[i]){
-//                 slot_array[p] = slot_element[k];
-//                 p++;
-//                 k++;
-//             }
-//             k = 0;
-//         }
-//     }
-//     else{//subspace_info->slot里的已经全部写入
-//         while(j < array_size ){
-//             slot_array[p].key = key[j];
-//             slot_array[p].addr = addr[j];
-//             j++;
-//             p++;
-//         }
-//     }
-//     nvm_index_persist_out_of_place(subspace_info , slot_array, p , nvm_index , free_list_head , slot_start);
-//     return p;
-// }
 
 /*
  * Commit exactly one complete leaf-slot image.  The transaction is scoped to
@@ -203,7 +116,6 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
     key_type key_min_array[SUBSPACE_MAX_KEY];
     uint8_t slot_key_num_array[SUBSPACE_MAX_KEY];
     int id_curr = 0  , pool_curr = 0 , key_min_curr = 0;
-    // int key_subspace = 0;
     int slot_subspace = 0;
 
     PMEMoid id;
@@ -214,7 +126,6 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
     int is_initialize = 0;
     /*首先找到nvm_index中需要修改的最小的leaf_node*/
     if(subspace_info->slot_num == 0){//初始化
-        // printf("11\n");
         id = nvm_index_get_free_node(nvm_index ,free_list_head , &pool);
         if(OID_IS_NULL(id)){
             fprintf(stderr, "failed to allocate initial leaf slot\n");
@@ -230,7 +141,6 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
         slot_element = initial_slot_image.entries;
         slot_element->key = buffer_key[0];
         is_initialize = 1;
-        // printf("initialize buffer_key[0] is %lu\n" , buffer_key[0]);
     }
 
     while(i < subspace_info->slot_num && subspace_info->min_key[i] <= buffer_key[0]){
@@ -238,7 +148,6 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
         id_array[i] = subspace_info->slot[i];
         key_min_array[i] = subspace_info->min_key[i];
         slot_key_num_array[i] = subspace_info->slot_key_num[i];
-        // key_subspace += subspace_info->slot_key_num[i];
 
         pool_curr++;
         id_curr++;
@@ -254,16 +163,12 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
         i--;
     }
 
-    /**/
-    // printf("22 , subspace_info->slot_num is %d i is %d\n" , subspace_info->slot_num , i);
     slot_subspace = subspace_info->slot_num;
-    // printf("buffer min key %lu max key %lu  i is %d\n" , buffer_key[0] , buffer_key[buffered_num - 1] , i);
     access_nvm();
     for( ; i < subspace_info->slot_num ; i++){
         last_k = k;
         j = 0;
         n = 0;
-        // printf("stop\n");
         if(i == subspace_info->slot_num - 1){//判断是否是最后一个slot
             k = buffered_num;
         }
@@ -272,11 +177,8 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
                 k++;
             }
         }
-        // printf("stop\n");
         //该slot内的索引不参与合并
         if(last_k == k){
-        // if((buffer_key[buffered_num - 1] < subspace_info->min_key[i] || last_k == k) ){
-            // printf("buffer_key[buffered_num - 1] is %d , subspace_info->min_key[i] is %d\n" ,buffer_key[buffered_num - 1] , subspace_info->min_key[i]);
             if(!nvm_index_output_has_room(pool_curr, id_curr, key_min_curr)){
                 fprintf(stderr, "slot update output exceeds local capacity\n");
                 return -1;
@@ -285,7 +187,6 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
             pool_array[pool_curr] = subspace_info->pool[i];
             id_array[id_curr] = subspace_info->slot[i];
             slot_key_num_array[key_min_curr] = subspace_info->slot_key_num[i];
-            // key_subspace += subspace_info->slot_key_num[i];
 
             pool_curr++;
             id_curr++;
@@ -308,15 +209,11 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
         /*merge_sort*/
         while(last_k < k || j < subspace_info->slot_key_num[i]){
             if( j < subspace_info->slot_key_num[i] && (last_k == k || buffer_key[last_k] > slot_element->key)){
-                // printf("last_k is %d k is %d\nbuffer_key[last_k] is %d slot_element->key is %d\n" , last_k , k,
-                // buffer_key[last_k] , slot_element->key);
-                // sleep(100);
                 slot_element_array[n] = *slot_element;
                 slot_element ++;
                 j++;
             }
             else if(last_k < k && (j == subspace_info->slot_key_num[i] ||  buffer_key[last_k] < slot_element->key)){
-                // printf("2\n");
                 slot_element_array[n].key = buffer_key[last_k];
                 slot_element_array[n].addr = buffered_addr[last_k];
                 subspace_info->key_num++;
@@ -324,8 +221,6 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
                 last_k++;
             }
             else{//插入已经存在的键值对
-                // printf("buffer_key[last_k] is %lu , slot_element->key is %lu\n" , buffer_key[last_k] , slot_element->key);
-                // sleep(10);
                 if(!is_initialize){
                     subspace_info->redundant_size += slot_element->addr.size;
                     g_map[slot_element->addr.block]--;
@@ -339,19 +234,14 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
             }
             n++;
         }
-        // printf("n is %d , slot_num is %d\n",n , slot_subspace);
-        // key_subspace += n;
         /*persist*/
         slot_element_array_p = slot_element_array;
         if(n > SLOT_MAX_ELEMENT){//slot splt
             slot_num = ((n - 1 )/ SLOT_MAX_ELEMENT) + 1;
             slot_num_sta = slot_num;
-            // printf("n is %d , slot_num is %d\n" ,n , slot_num );
             for(j = 0 ; j < slot_num_sta ; j++){
                 slot_aver_key = n / slot_num;
                 if( j == 0 ){//
-                    // pmemobj_memcpy_persist(subspace_info->pool[i] , (char *)pmemobj_direct(subspace_info->slot[i])
-                    // , slot_element_array_p, slot_aver_key * sizeof(struct slot_element));
                     struct nvm_index_slot slot_image = {0};
                     slot_image.boundary = subspace_info->boundary;
                     memcpy(slot_image.entries, slot_element_array_p,
@@ -361,11 +251,6 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
                            &slot_image) != 0){
                         return -1;
                     }
-                    // memcpy((char *)pmemobj_direct(subspace_info->slot[i]) , slot_element_array_p
-                    // , slot_aver_key * sizeof(struct slot_element));
-                    // pmem_persist()
-                    // pmem_memcpy_persist((char *)pmemobj_direct(subspace_info->slot[i]) ,
-                    // slot_element_array_p , slot_aver_key * sizeof(struct slot_element));
 
                     if(!nvm_index_output_has_room(pool_curr, id_curr, key_min_curr)){
                         fprintf(stderr, "slot update output exceeds local capacity\n");
@@ -378,18 +263,10 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
                     pool_curr++;
                     id_curr++;
                     key_min_curr++;
-                    // printf("key_min_curr is %d , slot_aver_key is %d\n" , key_min_curr , slot_aver_key);
                     slot_element_array_p += slot_aver_key;
-                    // slot_subspace++;
                 }
                 else{
                     id = nvm_index_get_free_node(nvm_index ,free_list_head , &pool);
-                    // printf("pool is %p , d.pool_uuid_lo is %lu id.off is %lu\n" , pool,  id.pool_uuid_lo,  id.off);
-                    // char * str = (char *)pmemobj_direct(id);
-                    // pmemobj_memset_persist(pool , str , 0 , 256);
-                    // printf("key_min_curr is %d , slot_aver_key is %d\n" , key_min_curr , slot_aver_key);
-                    // pmemobj_memset_persist(pool , (char *)pmemobj_direct(id) , 0 , 256);
-                    // printf("slot_element_array[last] is %p , slot_element_array_p is %p\n" , &slot_element_array[256] , slot_element_array_p);
                     if(OID_IS_NULL(id)){
                         fprintf(stderr, "failed to allocate split leaf slot\n");
                         return -1;
@@ -421,7 +298,6 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
                 }
                 n = n - slot_aver_key;
                 slot_num -- ;
-                // printf("slot_key_num_array[%d] is %d\n" , key_min_curr-1 , slot_key_num_array[key_min_curr-1]);
             }
         }
         else{//no split
@@ -437,8 +313,6 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
             }
 
 
-            // pmemobj_memcpy_persist(subspace_info->pool[i] , (char *)pmemobj_direct(subspace_info->slot[i])
-            // , slot_element_array, n * sizeof(struct slot_element));
 
             if(!nvm_index_output_has_room(pool_curr, id_curr, key_min_curr)){
                 fprintf(stderr, "slot update output exceeds local capacity\n");
@@ -453,7 +327,6 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
             id_curr++;
             key_min_curr++;
 
-            // slot_subspace++;
         }
 
     }
@@ -469,19 +342,11 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
                 (unsigned int)SUBSPACE_MAX_SLOT, subspace_info->key_num, buffered_num);
         return -1;
     }
-    // printf("subspace_info->key_num is %d , subspace_info->slot_num is %d\n" , key_subspace , slot_subspace);
-    // subspace_info_output(subspace_info);
     memcpy(subspace_info->pool , pool_array , pool_curr * sizeof(PMEMobjpool * ));
     memcpy(subspace_info->slot , id_array , id_curr * sizeof(PMEMoid));
     memcpy(subspace_info->min_key , key_min_array , key_min_curr * sizeof(key_type));
     memcpy(subspace_info->slot_key_num , slot_key_num_array , key_min_curr * sizeof(uint8_t));
-    // subspace_info->key_num  = key_subspace;
     subspace_info->slot_num = slot_subspace;
-
-    // if(buffer_key[m] == 8973697975121090291){
-    //     subspace_info_output_detail(subspace_info);
-    // }
-    // subspace_info_output(subspace_info);
     return 0;
 }
 
@@ -508,17 +373,12 @@ struct write_buffer_return_type nvm_index_insert(struct subspace_info * subspace
 int size , uint16_t WBF_seq , int thread){
     struct write_buffer_index * buffer_index = subspace_info->buffer_index;
     struct write_buffer_return_type return_value;
-    // struct subspace_info * new_subsapce_info;
     int level = random_level(buffer_index->reserve_levels - 1 , &random_seed[thread]);
     return_value =  write_buffer_index_insert(buffer_index , key , size , id , WBF_seq , level);
 
     subspace_info->buffered_size -= return_value.size;
     subspace_info->buffered_size += size;
 
-    // write_buffer_index_check(subspace_info);
-    // if(key == 8973697975121090291){
-    //     printf("return_value.size is %d , size is %d , buffered_size is %d\n" , return_value.size , size , subspace_info->buffered_size);
-    // }
     return return_value;
 }
 

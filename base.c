@@ -69,50 +69,13 @@ kv_version_type kv_record_next_thread_version(
 }
 
 void access_disk(){
-	// int expected;
-	// int success;
-	// int desired;
-	// struct timespec ts = {0, 10};
-
-	// do{
-	// 	expected = atomic_load(&active_thread_disk);
-	// 	if(expected >= MAX_NVM_CONCURRRENT){
-	// 		success = 0;
-	// 		nanosleep(&ts, NULL);
-	// 		continue;
-	// 	}
-	// 	desired = expected + 1;
-	// 	success = atomic_compare_exchange_weak(&active_thread_disk,&expected , desired);
-
-	// }while(!success);
-	// return ;
 }
 
 void access_disk_release(){
-	// atomic_fetch_sub(&active_thread_disk , 1);
-	// return ;
 }
 
 
 void access_nvm(){
-	// int expected;
-	// int success;
-	// int desired;
-	// struct timespec ts = {0, 10};
-
-	// do{
-	// 	expected = atomic_load(&active_thread);
-	// 	if(expected >= MAX_NVM_CONCURRRENT){
-	// 		// atomic_fetch_add(&nvm_access_conflicts, 1);  // 记录冲突次数
-	// 		success = 0;
-	// 		nanosleep(&ts, NULL);
-	// 		continue;
-	// 	}
-	// 	desired = expected + 1;
-	// 	success = atomic_compare_exchange_weak(&active_thread,&expected , desired);
-
-	// }while(!success);
-	// return ;
 }
 
 // 定期输出统计信息
@@ -122,8 +85,6 @@ void print_nvm_stats() {
 }
 
 void access_nvm_release(){
-	// atomic_fetch_sub(&active_thread , 1);
-	// return ;
 }
 
 void random_seed_initialize(int thread){
@@ -183,22 +144,6 @@ void random_seed_initialize(int thread){
 }
 
 /*返回值为0到max*/
-// int random_level(int max , unsigned int * seed)
-// {
-// 	int i = 0, level = 0;
-// 	for (i = 0; i < max; i++)
-// 	{
-// 		if ((rand_r(seed) % 4) == 0)
-// 		{
-// 			level++;
-// 		}
-// 		else{
-// 			break;
-// 		}
-// 	}
-// 	// printf("level is %d\n" , level);
-// 	return level;
-// }
 
 int random_level(int max , unsigned int * seed)
 {
@@ -208,32 +153,3 @@ int random_level(int max , unsigned int * seed)
     }
     return level;
 }
-
-
-// int random_level(int max , unsigned int * seed)
-// {
-// 	return 1;
-// }
-
-// void qpair_lock(int thread , int place_for_debug){
-// 	int qp_num = thread % ctr_max_qp;
-// 	if(g_qpair_lock_is_used[qp_num] == 1){//该qp被共享
-// 		if(pthread_mutex_lock(&g_qpair_lock[qp_num]) != 0){
-// 			printf("ERROR:pthread_mutex_lock %d failed\n" , qp_num);
-// 		}
-// 		// else{
-// 		// 	printf("thread %d lock %d\n" , thread , qp_num);
-// 		// }
-// 	}
-// 	return ;
-// }
-
-// void qpair_unlock(int thread){
-// 	int qp_num = thread % ctr_max_qp;
-// 	if(g_qpair_lock_is_used[qp_num] == 1){//该qp被共享
-// 		pthread_mutex_unlock(&g_qpair_lock[qp_num]);
-// 		// printf("thread %d unlock %d\n" , thread , qp_num);
-// 	}
-
-// 	return ;
-// }

@@ -3,7 +3,6 @@
 #define DDE2613F_91F7_46C9_B811_A96CE855E3BF
 #include "dram_index.h"
 #include "subspace.h"
-// #define P_FACTOR 0.5  // 层数生成概率因子
 
 #include <stdlib.h>
 #include <string.h>
@@ -27,10 +26,6 @@ typedef struct skipnode {
 typedef struct kvcache {
     skipnode *head;              // 跳表头节点
     int current_level;           // 当前最大层数
-    // size_t capacity;             // 缓存容量
-    // size_t size;                 // 当前缓存大小
-    // skipnode *lru_head;          // LRU链表头
-    // skipnode *lru_tail;          // LRU链表尾
 } kvcache;
 
 typedef struct lru_list{

@@ -21,23 +21,17 @@ void server_executor(void * arg){
     // 获取 NUMA 节点 ID (SPDK 中通常用 socket_id 表示 NUMA 节点)
     int numa_node = spdk_env_get_socket_id(core);
     printf("this is thread %d, starting , running on core %u (NUMA node %d)\n" , thread->thread , core, numa_node);
-    // sleep(20);
 
-    // printf("db is %p , db->ring is %p\n",db , db->ring);
     g_ticks = spdk_get_ticks_hz();
     while(!benchmark_completed){
-        // req = server_get_request(db->ring[thread->thread]);
         req_num = spdk_ring_dequeue(thread->spdk_ring , (void ** )requests , 1024);
         if(req_num){
             for(int i = 0 ; i < req_num; i++){
                 req = requests[i];
                 start = spdk_get_ticks();
                 if(req->type == 0){//get
-                    // printf("thread %d get %lu \n" ,thread->thread ,  req.key);
-                    // ((struct read_time_breakdown *)req->break_down)->start_time = start;
                     result = get(req->key , thread , &size , start , (struct read_time_breakdown *)req->break_down);
                     if(result == NULL && size == 0 ){//not exist
-                        // printf("ERROR:key %lu not found\n" , req->key);
                         result = (char *)malloc(db->size_value);
                         client_key_to_value(req->key, result, db->size_value);
                         server_submit_result(req->key , result , db->size_value , 0 , 0 ,
@@ -52,15 +46,11 @@ void server_executor(void * arg){
                         thread->spdk_result_ring[req->key % db->load_injectors] , start , NULL);
                     }
                 }
-                    // printf("thread %d get %d done\n" ,thread->thread ,  req.key);
                 else if(req->type == 1){//put
-                    // ((struct insert_time_breakdown *)req->break_down)->start_time = start;
                     insert(req->key , req->size , req->value , thread , (struct insert_time_breakdown *)req->break_down);
-                    // printf("thread %d put %lu done %lu\n" ,thread->thread ,  req->key , req->key % db->load_injectors);
                     server_submit_result(req->key , req->value , 0,  1 , 0 ,
                     thread->spdk_result_ring[req->key % db->load_injectors]  , start ,
                     req->break_down);
-                    // ((struct insert_time_breakdown *)req->break_down)->submit_time = spdk_get_ticks() - start;
                 }
                 else if(req->type == 2){//scan
                     if(scan(req->key, req->size, req->value,  thread , start)){
@@ -74,7 +64,6 @@ void server_executor(void * arg){
                     thread->spdk_result_ring[req->key % db->load_injectors] , start , NULL);
                 }
                 else{
-                    // start[thread->thread] = spdk_get_ticks();
                 }
                 thread_completed[thread->thread]++;
                 free(req);

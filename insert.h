@@ -4,7 +4,6 @@
 #include "./kvbuffer.h"
 #include "./index.h"
 #include "./leaf_node_file.h"
-// #include "subspace.h"
 #include <libpmemobj/base.h>
 #include "./merge_flush.h"
 #include "./spdk_struct.h"

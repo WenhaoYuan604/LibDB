@@ -93,21 +93,15 @@ void scan_cb(void * ctx, const struct spdk_nvme_cpl * cpl){
     task->block_completed ++;
 
     if(task->block_completed >= task->total_block_num){
-        // printf("scan %lu length %d start get %d key blocknum %d\n" , task->key , scan_result->key_num , task->buffered_num , task->total_block_num);
         for(int i = 0 ; i < task->buffered_num ; i++){
-            // printf("i is %d task->is_in_write_buffer[i] is %d buffered_num is %d\n" , i , task->is_in_write_buffer[i], task->buffered_num);
             if(task->kvcache_hit[i] || task->is_in_write_buffer[i]){
-                // free(scan_result->value[i]);
                 continue;
             }
             k = binary_search(task->block_array , task->total_block_num,  addr[i].block);
-            // printf("k is %d\n" , k);
             if(k < 0){
-                // printf("ERROR:scan:fail to scan cb find block for block %d start %lu i %d\n" , addr[i].block , task->key , i);
                 exit(EXIT_FAILURE);
             }
             else{
-                // printf("***scan_result->value[i] is %p\n", scan_result->value[i]);
                 const char *record = task->buffer + k * BLOCK_SIZE + addr[i].off;
                 struct kv_record_view view;
                 if(kv_record_decode_for_key(record, addr[i].size,
@@ -133,11 +127,8 @@ void scan_cb(void * ctx, const struct spdk_nvme_cpl * cpl){
             , &task->is_in_write_buffer[n] , thread->thread);
             n += task->valid_key_per_subspace[i];
         }
-        // kvcache_update_batch(thread->kvcache , scan_result->key , scan_result->value, scan_result->value_size ,
-        //   task->buffered_num, task->kvcache_hit , task->is_in_write_buffer, thread->thread);
         server_submit_result(task->key, (char *)scan_result , task->buffered_num , 2 , 0 ,
         thread->spdk_result_ring[task->key % thread->db->load_injectors] , task->start , NULL);
-        // printf("server_submit_result done\n");
         free(task->block_array);
         free(task->buffered_addr);
         free(task->is_in_write_buffer);
@@ -146,7 +137,6 @@ void scan_cb(void * ctx, const struct spdk_nvme_cpl * cpl){
         free(task->subspace_info_array);
         free_task(task);
 
-        // printf("scan %lu length %d start get %d key blocknum %d done\n" , task->key , scan_result->key_num , task->buffered_num , task->total_block_num);
     }
     return ;
 }
@@ -201,8 +191,6 @@ static struct dram_index_node *get_next_leaf(struct dram_index_node *leaf) {
 }
 
 struct subspace_info ** dram_index_scan(struct thread * thread , key_type key, int length, int * subspace_num , int * found_key) {
-    // struct dram_index temp_index;
-    // temp_index.head = head;
     int index = -1 ;
     int max_subspace = 2;
     struct dram_index_node *leaf_node = NULL;
@@ -222,29 +210,21 @@ struct subspace_info ** dram_index_scan(struct thread * thread , key_type key, i
         return NULL;
     }
     result[0] = subspace;
-    // printf("check first subspace %p key num %d\n",subspace,subspace->key_num);
-    // write_buffer_index_check(subspace);
-    // printf("check first subspace done\n");
     int count = 1;
     int total = 0;
     struct dram_index_node *current_leaf = leaf_node;
     int current_i = index + 1;
 
-    // 辅助函数声明
-    // struct dram_index_node *get_next_leaf(struct dram_index_node *leaf);
 
     while (current_leaf != NULL) {
         while (current_i < current_leaf->nchild) {
             if(count >= max_subspace){
-                // printf("count is %d max_subspace is %d\n" , count,max_subspace);
                 max_subspace *= 2;
                 result = (struct subspace_info **)realloc(result, sizeof(struct subspace_info *) * max_subspace);
             }
             struct subspace_info *current_sub = current_leaf->subspaces[current_i];
 
             result[count] = current_sub;
-            // printf("check subspace %p key num %d\n",current_sub,current_sub->key_num);
-            // write_buffer_index_check(current_sub);
             count++;
             total += current_sub->key_num;
 
@@ -276,9 +256,6 @@ int subspace_write_buffer_leaf_node_scan(struct subspace_info ** subspace_info_a
     int found_keys = 0;
     int found_keys_last_subspace = 0;
 
-    // for (int i = 0; i < subspace_num && found_keys < length; i++) {
-    //     // write_buffer_index_check(subspace_info_array[i]);
-    // }
 
     // 遍历所有 subspace
     for (i = 0; i < subspace_num && found_keys < length; i++) {
@@ -302,35 +279,6 @@ int subspace_write_buffer_leaf_node_scan(struct subspace_info ** subspace_info_a
         if (slot_idx == current_subspace->slot_num) {
             slot_idx = current_subspace->slot_num - 1;
         }
-        // int left = 0;
-        // int right = current_subspace->slot_num - 1;
-        // while (left <= right) {
-        //     int mid = left + (right - left) / 2;
-        //     if (mid < current_subspace->slot_num - 1 &&
-        //         current_subspace->min_key[mid] <= key1 &&
-        //         current_subspace->min_key[mid + 1] > key1) {
-        //         slot_idx = mid;
-        //         break;
-        //     } else if (mid == current_subspace->slot_num - 1 && current_subspace->min_key[mid] <= key1) {
-        //         slot_idx = mid;
-        //         break;
-        //     } else if (current_subspace->min_key[mid] > key1) {
-        //         right = mid - 1;
-        //     } else {
-        //         left = mid + 1;
-        //     }
-        // }
-
-        // if (left > right) {
-        //     if (right >= 0) {
-        //         slot_idx = right;
-        //     } else if (current_subspace->slot_num > 0) {
-        //         slot_idx = 0;
-        //     } else {
-        //         // 没有 slot，跳过当前 subspace
-        //         continue;
-        //     }
-        // }
 
         if (slot_idx >= 0 && slot_idx < current_subspace->slot_num) {
             slot_element = subspace_slot_elements(current_subspace, (uint32_t)slot_idx);
@@ -494,7 +442,6 @@ bool scan(key_type key1 , int length , char * value , struct thread * thread , u
 
     struct scan_kv * scan_result = (struct scan_kv *)value;
     struct subspace_info ** subspace_info_array;
-    // struct subspace_info * subspace_info;
     struct address_type * addr = (struct address_type *)malloc(sizeof(struct address_type) * length);
     struct write_buffer_index_node ** buffer_node = (struct write_buffer_index_node **)malloc(sizeof(struct write_buffer_index_node *) * length);
     int * is_in_write_buffer = (int *)malloc(sizeof(int) * length);
@@ -511,7 +458,6 @@ bool scan(key_type key1 , int length , char * value , struct thread * thread , u
     int n = 0;
 
 
-    // printf("scan %lu length %d start\n" , key1 , length);
     subspace_info_array = dram_index_scan(thread, key1 , length , &subspace_num , &found_key);
 
     if(subspace_info_array == NULL){
@@ -536,7 +482,6 @@ bool scan(key_type key1 , int length , char * value , struct thread * thread , u
         return EXIT_SUCCESS;
     }
     //优先减少磁盘的带宽占用
-    // memset(is_in_write_buffer , 0 , sizeof(int) * length);
     memset(kvcache_hit , 0 , sizeof(int) * length);
 
     for(int i = 0 ; i < valid_subspace ; i++){
@@ -546,9 +491,7 @@ bool scan(key_type key1 , int length , char * value , struct thread * thread , u
         n += valid_key_per_subspace[i];
     }
 
-    // kvcache_hit_num = kvcache_get_batch(thread->kvcache, scan_result->key , scan_result->value, scan_result->value_size, found_key , kvcache_hit);
     block_num = addr_to_block(addr , is_in_write_buffer , kvcache_hit ,  block , found_key);
-    // printf("found_key is %d , length is %d\n",found_key,length);
 
     for(int i = 0 ; i < found_key ; i++){
         if(kvcache_hit[i] == 1){//kvcache命中
@@ -611,7 +554,6 @@ bool scan(key_type key1 , int length , char * value , struct thread * thread , u
 
     int qpair_excuting_once , rc ;
     int qpair_num = thread->thread % ctr_max_qp;
-    // qpair_lock(thread->thread , 2);
     task = get_free_task(thread->ns_entry , thread->thread);
     while(task == NULL){//qpair已满
         if((qpair_excuting_once = spdk_nvme_qpair_process_completions(thread->ns_entry->qpair[qpair_num], 0)) < 0){
@@ -635,7 +577,6 @@ bool scan(key_type key1 , int length , char * value , struct thread * thread , u
     task->kvcache_hit = kvcache_hit;
     task->start = start;
 
-    // task->subspace_info = *subspace_info_array;
     task->subspace_info_array = (void **)subspace_info_array;
     task->subspace_num = valid_subspace;
     task->valid_key_per_subspace = valid_key_per_subspace;
@@ -648,7 +589,6 @@ bool scan(key_type key1 , int length , char * value , struct thread * thread , u
         block[i] * physical_block_to_logical_block , physical_block_to_logical_block, scan_cb , task , 0);
         if (rc != 0) {
             printf("ERROR:starting read I/O failed\n");
-            // qpair_unlock(thread->thread);
             return 1;
         }
         else{
@@ -656,12 +596,6 @@ bool scan(key_type key1 , int length , char * value , struct thread * thread , u
     }
 
 
-    // printf("start to ckeck scan %lu length %d\n" , key1 , length);
-    // for(int i = 0; i < subspace_num;i++){
-    //     // printf("ckeck scan %lu length %d subspace[%d] %p\n" , key1 , length, i , subspace_info_array[i]);
-    //     // write_buffer_index_check(subspace_info_array[i]);
-    // }
     free(buffer_node);
-    // free(subspace_info_array);
     return 0;
 }

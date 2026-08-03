@@ -6,16 +6,12 @@
 /* 先完成 subspace_info，再拉 write_buffer_index / kvcache，避免与 nvm_index.h 等组成循环包含 */
 struct write_buffer_index;
 struct kvcache;
-// #include "./spdk_struct.h"
-// #include "./db.h"
-// #include "./kvbuffer.h"
 struct subspace_info{
     key_type boundary;//该 group 在 DRAM index 中的边界
     uint32_t key_num;//该subspace的键值对个数
     uint32_t slot_num;//该subspace的slot个数
     uint32_t flush_block_num;
     uint32_t total_block_num;
-    // uint32_t * block_array;
     bool is_gc;
     bool is_spliting;
 
@@ -61,59 +57,8 @@ static inline key_type subspace_slot_boundary(
 }
 
 void subspace_info_output( struct subspace_info * subspace_info );
-
 struct subspace_info * subspace_info_initialize();
-
 void subspace_info_output_detail( struct subspace_info * subspace_info );
-
 void subspace_info_output_all();
+
 #endif
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// struct root_for_subspace{
-//     PMEMoid id;
-//     short off;
-// };
-
-// struct subspace{
-//     PMEMobjpool * buffer;
-//     int subspace_size;
-//     int subspace_total;
-//     struct inf_for_subspace * inf;
-//     struct ns_entry * ns_entry;
-//     struct free_space * fs;
-//     struct segment ** cur_segment;
-// };
-
-// struct subspace_buffer{
-//     char buffer[4096];
-// };
-
-// struct inf_for_subspace{
-//     int used;//该subspace的buffer已占用空间大小
-//     int curr_block;//该subspace
-//     int total_size;//
-//     int valid_size;//
-// };
-
-// int get_subspace_seq(key_type key , int subapce_size);
-
-// struct subspace * initialize_subspace(int num_subspace);
-
-// // int pm_subspace_alloc_buffer(int num_subspace , PMEMobjpool * buffer);
-
-// struct subspace_buffer * pm_get_subspace_buffer(int subspace_seq , struct subspace * subspace);
-
-// // char * read_from_subspace(int subspace_seq , struct subspace * subspace);

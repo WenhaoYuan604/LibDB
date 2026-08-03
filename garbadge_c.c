@@ -150,10 +150,6 @@ int fill_buffer_and_update_index(char * buffer , struct subspace_info * subspace
     uint32_t block_curr = 0;
     int off = 0;
     /* 记录当前块中 KV 个数及最后一个 KV 的信息，用于尾部小块优化 */
-    // int last_block_kv_cnt = 0;
-    // key_type last_block_key = 0;
-    // int last_block_size = 0;
-    // int last_block_src_off = 0;
     char * buffer_to_store = (char *)malloc(sizeof(char)* BLOCK_SIZE * block_size);
     struct nvm_slot_update *slot_updates = (struct nvm_slot_update *)calloc(
         SUBSPACE_MAX_SLOT, sizeof(struct nvm_slot_update));
@@ -165,12 +161,8 @@ int fill_buffer_and_update_index(char * buffer , struct subspace_info * subspace
         return -1;
     }
     int used_block;
-    // uint32_t new_block;
     int k;
 
-    // for(int i = 0 ; i < block_size ; i++){
-    //     printf("block[%d]:%d\n" , i , block[i]);
-    // }
     new_block[0] = get_free_block(&thread->curr_segment , thread->fs);
     access_nvm();
     for(int i = 0 ; i < subspace_info->slot_num ; i++){
@@ -195,10 +187,7 @@ int fill_buffer_and_update_index(char * buffer , struct subspace_info * subspace
                     block_curr ++;
                     off = 0;
                     /* 开始新的块，重置当前块内计数 */
-                    // last_block_kv_cnt = 0;
                     if(block_curr >= block_size){
-                        // subspace_info_output_detail(subspace_info);
-                        // sleep(100);
                     }
                 }
 
@@ -206,22 +195,8 @@ int fill_buffer_and_update_index(char * buffer , struct subspace_info * subspace
                 memcpy(buffer_to_store + BLOCK_SIZE * block_curr + off ,
                 buffer + BLOCK_SIZE * (k - 1) + slot_element->addr.off, slot_element->addr.size);
                 /* 记录当前块最后一个 KV 的信息（用于尾部少量数据写回 NVM 写缓存） */
-                // last_block_kv_cnt++;
-                // last_block_key = slot_element->key;
-                // last_block_size = slot_element->addr.size;
-                // last_block_src_off = BLOCK_SIZE * (k - 1) + slot_element->addr.off;
-                /*更新索引*/
-                // if(slot_element->key == 2868507471843578397 || slot_element->key == 5701971673652973468){
-                //     printf("key %lu choosed ,old addr block:%d off %d\n" , slot_element->key , slot_element->addr.block , slot_element->addr.off);
-                //     printf("buffer src is %s\n" ,buffer + BLOCK_SIZE * (k - 1) + slot_element->addr.off + KV_RECORD_HEADER_SIZE);
-                // }
-                // printf("slot[%d][%d]:key %d ,old block %d , new_block is %d , off is %d\n" ,i , j ,slot_element->key ,slot_element->addr.block ,  new_block , off);
                 slot_element->addr.block = new_block[block_curr];
                 slot_element->addr.off = off;
-                // printf("block_size is %d , block[0] is %d\n" , block_size , block[0]);
-                // if(slot_element->key == 2868507471843578397 || slot_element->key == 5701971673652973468){
-                //     printf("key %lu choosed ,new addr block:%d off %d\n" , slot_element->key , new_block[block_curr] , off);
-                //     printf("buffer dest is %s\n" ,buffer_to_store + BLOCK_SIZE * block_curr + off + KV_RECORD_HEADER_SIZE);
                 off += slot_element->addr.size;
                 slot_changed = 1;
                 g_map[new_block[block_curr]] ++;
@@ -242,7 +217,6 @@ int fill_buffer_and_update_index(char * buffer , struct subspace_info * subspace
         int tail_end   = tail_start + off;
 
         // 检查是否可以与NVM缓存数据合并写入SSD
-        // int buffer_index_size = calculate_buffer_index_size(subspace_info->buffer_index);
 
         if (off + (int)subspace_info->buffered_size >= BLOCK_SIZE) {
             // 优化路径：尾部数据 + NVM缓存数据 可以填充一个块
@@ -379,7 +353,6 @@ int fill_buffer_and_update_index(char * buffer , struct subspace_info * subspace
     *slot_updates_out = slot_updates;
     *slot_update_count_out = slot_update_count;
     return used_block;
-    //获取空闲块:block =  get_free_block(&thread->curr_segment , thread->fs);
 }
 
 void garbadge_collection_cb(void *arg, const struct spdk_nvme_cpl *completnio){
@@ -392,7 +365,6 @@ void garbadge_collection_cb(void *arg, const struct spdk_nvme_cpl *completnio){
     uint32_t * new_block;
     uint64_t start_time , end_time;
 
-    // printf("garbadge_collection_cb start\n");
     start_time = spdk_get_ticks();
     if(spdk_nvme_cpl_is_error(completnio)){
         task->gc_io_failed = 1;
@@ -411,7 +383,6 @@ void garbadge_collection_cb(void *arg, const struct spdk_nvme_cpl *completnio){
             exit(EXIT_FAILURE);
         }
         memset(new_block, 0, sizeof(uint32_t) * task->total_block_num);
-        // printf("task->block_completed is %d\n" , task->block_completed);
         task->block_array_to_gc = task->block_array;
         task->total_block_num_to_gc = task->total_block_num;
         /*提交写任务*/
@@ -429,12 +400,8 @@ void garbadge_collection_cb(void *arg, const struct spdk_nvme_cpl *completnio){
         task->total_block_num = blocks_to_write;
         task->gc_io_failed = 0;
         task->block_completed = 0;
-        // free(task->block_array);
-        // task->block_array = (uint32_t *)malloc(sizeof(uint32_t) * task->total_block_num);
         /*new_subspace*/
-        // printf("task->total_block_num is %d\n"  ,task->total_block_num);
         for(int i = 0 ; i < task->total_block_num ; i++){
-            // block =  get_free_block(&thread->curr_segment , thread->fs);
             thread_block_rw[thread->thread] ++;
             thread_gc_block_rw[thread->thread]++;
             thread_gc_block_write[thread->thread]++;
@@ -446,7 +413,6 @@ void garbadge_collection_cb(void *arg, const struct spdk_nvme_cpl *completnio){
             }
         }
 
-        // free(task->block_array);
         free(new_block);
 
     }
@@ -472,8 +438,6 @@ uint32_t * block_redundant_compute(struct subspace_info * subspace_info , int * 
             if (redundant_element->block_redundant_size == BLOCK_SIZE)
                 size++;
             redundant_element->block_redundant_size -= addr->size;
-            // printf("slot[%d]elements[%d] key %u addr %d %d\n",i , j , slot_elements[j].key , slot_elements[j].addr.block , slot_elements[j].addr.off);
-            // printf("redundant_element block %u , block_redundant_size %u\n" , redundant_element->block , redundant_element->block_redundant_size);
         }
     }
     access_nvm_release();
@@ -481,7 +445,6 @@ uint32_t * block_redundant_compute(struct subspace_info * subspace_info , int * 
     if (subspace_info->total_block_num > size) {
         invalid_block_num[thread->thread] += subspace_info->total_block_num - size;
         // 这里 invalid_block_num 就是“索引中完全看不到”的块数量
-        // subspace_info->redundant_size += invalid_block_num * BLOCK_SIZE;
     }
 
     qsort(redundant_array, subspace_info->total_block_num, sizeof(struct redundant_element), __redundant_comp);
@@ -495,7 +458,6 @@ uint32_t * block_redundant_compute(struct subspace_info * subspace_info , int * 
         else{
             subspace_info->redundant_size += redundant_array[i].block_redundant_size;//未被选中gc
         }
-        // printf("block %d redundant_size %d\n" , redundant_array[i].block , redundant_array[i].block_redundant_size);
     }
     free(redundant_array);
     *array_size = j;
@@ -513,12 +475,6 @@ void garbadge_collection(struct subspace_info * subspace_info ,struct thread * t
 
     /*计算每个块的冗余度*/
     redundant_array = block_redundant_compute(subspace_info , &redundant_array_size , thread);
-    // subspace_info_output_detail(subspace_info);
-    // printf("redundant_array_size is %d\n" , redundant_array_size);
-    // for(int i = 0 ; i < redundant_array_size ; i++){
-    //     printf("block %d choosen\n" , redundant_array[i]);
-    // }
-    // qpair_lock(thread->thread , 2);
     task = get_free_task(ns_entry , thread->thread);
     while(task == NULL){//qpair已满
         if((qpair_excuting_once = spdk_nvme_qpair_process_completions(
@@ -541,7 +497,6 @@ void garbadge_collection(struct subspace_info * subspace_info ,struct thread * t
     /*选择冗余度最高的部分块*/
     /*提交读取任务*/
     for(int i = 0 ; i < redundant_array_size ; i++){
-        // printf("read block%u block_array_size is %d\n" , block_array[i] , block_array_size);
         thread_block_rw[thread->thread] ++;
         thread_gc_block_rw[thread->thread] ++;
         rc = spdk_nvme_ns_cmd_read(ns_entry->ns, ns_entry->qpair[qpair_num], (task->buffer + i * BLOCK_SIZE),
@@ -551,6 +506,5 @@ void garbadge_collection(struct subspace_info * subspace_info ,struct thread * t
             exit(EXIT_FAILURE);
         }
     }
-    // qpair_unlock(thread->thread);
     return ;
 }

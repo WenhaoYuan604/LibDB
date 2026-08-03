@@ -15,14 +15,11 @@
 
 
 /*将整个键空间划分为 thread * size个大小相等的子空间*/
-// struct subspace_info * g_subspace_info = NULL;
 
 key_type ** subspace_split_initialize(int thread , int size){
-    // static_assert(key_size <= 8 , "The key size is assumed not to be greater than 8 bytes");
     key_type ** boundary = (key_type **)malloc(sizeof(key_type*) * thread);
 
     int64_t x = pow(10 , 19) / thread / size, y = 0;
-    // int64_t x = 500000000 / thread / size, y = 0;
     for(int i = 0 ; i< thread ; i++){
         boundary[i] = (key_type * )malloc(sizeof(key_type) * size);
     }
@@ -280,45 +277,6 @@ void write_buffer_index_split(struct subspace_info * subspace_info , struct subs
         new_subspace_info->buffer_index->head->forward[i] = node->forward[i];
         node->forward[i] = NULL;
     }
-    // index = subspace_info->buffer_index->next;
-    // prev_index = subspace_info->buffer_index;
-    // while(index){
-    //     new_index = (struct write_buffer_index  *)malloc(sizeof(struct write_buffer_index));
-    //     write_buffer_index_init(new_index);
-    //     node = index->head;
-    //     for(int i = index->levels - 1 ; i >= 0 ; i ++){
-    //         while (node->forward[i] && node->forward[i]->key < boundary)
-    //             node = node->forward[i];
-    //     new_index->head->forward[i] = node->forward[i];
-    //     node->forward[i] = NULL;
-    //     }
-    //     prev_index->next = new_index;
-    //     new_index->prev = prev_index;
-    //     new_index->next = NULL;
-    //     prev_index = new_index;
-    //     index = index->next;
-    // }
-
-    // for (int i = subspace_info->buffer_index->levels - 1; i >= 0; i--) {
-    //     while (node->forward[i] && node->forward[i]->key < boundary)
-    //         node = node->forward[i];
-    //     new_subspace_info->buffer_index->head->forward[i] = node->forward[i];
-    //     node->forward[i] = NULL;
-    // }
-
-
-    // for (int i = subspace_info->buffer_index->levels - 1; i >= 0; i--) {
-    //     struct write_buffer_index_node * node = subspace_info->buffer_index->head;
-    //     while (node->forward[i] && node->forward[i]->key < boundary)
-    //         node = node->forward[i];
-
-    //     // 保存分割点的下一个节点
-    //     new_subspace_info->buffer_index->head->forward[i] = node->forward[i];
-    //     node->forward[i] = NULL;
-    // }
-
-    // write_buffer_index_check(subspace_info);
-    // write_buffer_index_check(new_subspace_info);
 }
 
 void subspace_info_buffer_resize(struct subspace_info * subspace_info){
@@ -1024,7 +982,6 @@ struct subspace_info * subspace_split(struct subspace_info * subspace_info , str
     int qpair_excuting_once , rc;
     struct ns_entry * ns_entry = thread->ns_entry;
     int qpair_num = thread->thread % ctr_max_qp;
-    // printf("subspace_split start\n");
     /*其实有一些块是不用读的，以待优化 , block_array不是从小到大排列的*/
 
     block_array = block_to_read_and_prepare_split(
@@ -1035,8 +992,6 @@ struct subspace_info * subspace_split(struct subspace_info * subspace_info , str
         fprintf(stderr, "ERROR: failed to prepare logical subspace split\n");
         exit(EXIT_FAILURE);
     }
-    // printf("block_array_size is %d\n" , block_array_size);
-    // status[thread->thread] = 9;
     task = get_free_task(ns_entry , thread->thread);
     while(task == NULL){//qpair已满
         if((qpair_excuting_once = spdk_nvme_qpair_process_completions(
@@ -1044,10 +999,8 @@ struct subspace_info * subspace_split(struct subspace_info * subspace_info , str
                 printf("ERROR:fail to process_completions qpair[%d]\n" , qpair_num);
                 return 0;
         }
-        // if(qpair_excuting_once > 0){
         task = get_free_task(ns_entry , thread->thread);
     }
-    // status[thread->thread] = 10;
 
     task->thread = thread;
     task->total_block_num = block_array_size;
@@ -1060,18 +1013,9 @@ struct subspace_info * subspace_split(struct subspace_info * subspace_info , str
     task->key = *key_out;
 
     for(int i = 0 ; i < block_array_size ; i ++){
-        // printf("read block %u block_array_size is %d\n" , block_array[i] , block_array_size);
         thread_block_rw[thread->thread] ++;
         thread_split_block_rw[thread->thread]++;
 
-        // rc = spdk_nvme_ns_cmd_read(ns_entry->ns, ns_entry->qpair[qpair_num], (task->buffer + i * BLOCK_SIZE),
-        // block_array[i] * physical_block_to_logical_block  ,1 * physical_block_to_logical_block , split_cb , task , 0);
-        // if (rc != 0) {
-        //     printf("subspace_split ERROR:starting read I/O failed\n");
-        //     printf("block is %u , i is %u , block_array_size is %u , rc is %u\n" , block_array[i] , i , block_array_size , -rc);
-        //     // qpair_unlock(thread->thread);
-        //     return 0;
-        // }
         while ((rc = spdk_nvme_ns_cmd_read(
             ns_entry->ns, ns_entry->qpair[qpair_num],
             task->buffer + (size_t)i * BLOCK_SIZE,
@@ -1086,11 +1030,7 @@ struct subspace_info * subspace_split(struct subspace_info * subspace_info , str
             exit(EXIT_FAILURE);
         }
     }
-    // ENXIO
-    // printf("subspace_split done\n");
-    // qpair_unlock(thread->thread);
     fflush(stdout);
-    // new_subspace_info = nvm_index_split(subspace_info , );
 
     return new_subspace_info;
 
@@ -1122,29 +1062,14 @@ void flush_cb(void *arg, const struct spdk_nvme_cpl *completnio){
         exit(EXIT_FAILURE);
     }
     flushed_block_num = task->total_block_num;
-    // printf("task->block_completed is %d , task->total_block_num is %d\n" ,task->block_completed, task->total_block_num);
-    // printf("task->buffered_num is %d\n" , task->buffered_num);
-    // start_time = spdk_get_ticks();
-    // ((struct insert_time_breakdown *)task->break_down)->spdk_write_time = start_time - ((struct insert_time_breakdown *)task->break_down)->spdk_write_time;
     /*释放被缓存的键值对占用的write_buffer*/
-    // printf("nvm_index_insert_after_flush start\n");
     if(nvm_index_insert_after_flush(subspace_info, thread->index->nvm_index, task->buffered_key,
                                     (struct address_type *)task->buffered_addr, task->buffered_num,
                                     &(thread->index_free_head)) != 0){
         fprintf(stderr, "fatal: leaf-slot update failed\n");
         exit(EXIT_FAILURE);
-    // printf("nvm_index_insert_after_flush done\n");
     }
 
-    // if(subspace_info == g_subspace_info){
-    //     index = subspace_info->buffer_index;
-    //     // printf("after flush\n");
-    //     while(index){
-    //         printf("index is %p , next is %p , prev is %p " , index , index->next , index->prev);
-    //         index = index->next;
-    //     }
-    //     printf("\n");
-    // }
 
     if(old_index == NULL){
         printf("ERROR:flush_cb old_index = NULL\n");
@@ -1155,72 +1080,51 @@ void flush_cb(void *arg, const struct spdk_nvme_cpl *completnio){
         exit(EXIT_FAILURE);
     }
     else if(old_index->next == NULL){
-        // printf("old_index is %p , old_index->next is %p , old_index->prev is %p\n" , old_index , old_index->next , old_index->prev);
         old_index->prev->next = NULL;
     }
     else{
         old_index->prev->next = old_index->next;
-        // printf("old_index is %p , old_index->next is %p , old_index->prev is %p\n" , old_index , old_index->next , old_index->prev);
         old_index->next->prev = old_index->prev;
-        // subspace_info_output_detail(subspace_info);
     }
 
-    // printf("write_buffer_index_destroy start\n");
     write_buffer_index_destroy(old_index);
-    // write_buffer_index_check(subspace_info);
-    // printf("write_buffer_index_destroy done\n");
 
     for(int i = 0  ; i < task->buffered_num ; i++){
         write_buffer_free(buffer_to_free[i].id , buffer_to_free[i].WBF_seq , buffer_to_free[i].size , &(thread->buffer_free_head));
-        // printf("write_buffer_free done\n");
     }
-    // sleep(5);
     free(task->buffer_to_free);
     free(task->buffered_addr);
     free(task->buffered_key);
     /*更新write_buffer_index*/
-    // write_buffer_index_update_after_flush(subspace_info->buffer_index , task->head_to_free_seq);
     free_task(task);
     /*检查更新后的subspace的容量*/
     subspace_info->flush_block_num -- ;
     subspace_info->total_block_num += flushed_block_num;
 
-    // end_time = spdk_get_ticks();
-    // printf("subspace_info->key_num is %d\n" , subspace_info->key_num);
-    // insert_breakdown[thread->thread].flush_cb_time += end_time - start_time;
     if(subspace_info->key_num >= SUBSPACE_MAX_KEY){
         if(subspace_info->flush_block_num != 0 || subspace_info->is_gc){
             return ;
         }
         else{
-            // start_time = spdk_get_ticks();
             subspace_info->is_spliting = 1;
-            // printf("subspace_info->key_num is %d\n" , subspace_info->key_num);
             subspace_info_new_subspace =  subspace_split(subspace_info ,  thread , &key_new_subspace);
             subspace_info_new_subspace->is_spliting = 1;
             /*将分裂后新产生的subspace插入索引*/
             dram_index_insert(thread->index->dram_index , key_new_subspace , subspace_info_new_subspace , 0);
-            // end_time = spdk_get_ticks();
-            // insert_breakdown[thread->thread].split_time += end_time - start_time;
         }
     }
     else if(subspace_info->redundant_size >= subspace_info->total_block_num * BLOCK_SIZE * SUBSPACE_REDUNDANT_PERCENT_THRESHOLD){
         if(subspace_info->flush_block_num != 0 || subspace_info->is_spliting){
             return ;
         }
-        // printf("ERROR: subspace_info->total_block_num is %d , subspace_info->redundant_size is %d\n" ,
-        // subspace_info->total_block_num , subspace_info->redundant_size);
         if(!subspace_info->is_gc){
             start_time = spdk_get_ticks();
-            // subspace_info_output_detail(subspace_info);
             subspace_info->is_gc = 1;
             garbadge_collection(subspace_info , thread);
             end_time = spdk_get_ticks();
             insert_breakdown[thread->thread].gc_time += end_time - start_time;
-            // sleep(10);
         }
     }//一个subspace只能由一个thread访问
-    // subspace_info_output(subspace_info);
 
     return ;
 }
@@ -1257,7 +1161,6 @@ int flush_write_buffer_to_ssd(struct subspace_info * subspace_info , struct thre
     }
 
     struct write_buffer_index * index;
-    // printf("qpair_lock start\n");
 
     uint32_t FlushBlock[LIBDB_TASK_BUFFER_BLOCK_COUNT];
     for(uint32_t i = 0; i < flush_block_num; i++){
@@ -1266,29 +1169,20 @@ int flush_write_buffer_to_ssd(struct subspace_info * subspace_info , struct thre
 
 
     subspace_info->flush_block_num ++;
-    // qpair_lock(thread->thread , 2);
-    // printf("qpair_lock done\n");
-    // printf("get_free_task start , thread->thread is %d\n" , thread->thread);
     task = get_free_task(ns_entry , thread->thread);
 
-    // status[thread->thread] = 7;
     while(task == NULL){//qpair已满
-        // printf("task == NULL , ns_entry is %p ns_entry->task_array_head[%d] is %p\n" , ns_entry ,thread->thread ,  ns_entry->task_array_head[0]);
         if((qpair_excuting_once = spdk_nvme_qpair_process_completions(ns_entry->qpair[qpair_num], 0)) < 0){
                 printf("ERROR:fail to process_completions qpair[%d]\n" , qpair_num);
                 return 0;
         }
-        // if(qpair_excuting_once > 0){
         task = get_free_task(ns_entry , thread->thread);
     }
-    // printf("get_free_task done\n");
 
-    // status[thread->thread] = 8;
     /*记录下被flush到SSD的node*/
 
     memset(task->buffer, 0, flush_block_num * BLOCK_SIZE);
     subspace_info->buffer_index = write_buffer_copy(old_index, task->buffer, last_insert, thread->thread);
-    // write_buffer_index_check(subspace_info);
     if(subspace_info->buffer_index->prev != NULL || subspace_info->buffer_index->next != NULL){
         printf("ERROR:init write buffer index ERROR\n");
         sleep(100);
@@ -1297,14 +1191,11 @@ int flush_write_buffer_to_ssd(struct subspace_info * subspace_info , struct thre
     if(old_index->prev != NULL){
         printf("ERROR:flush_write_buffer_to_ssd old_index->prev != NULL is %p\n" , old_index->prev);
         printf("flush_write_buffer_to_ssd:subspace_info is %p\n" , subspace_info);
-        // sleep(100);
-        // exit(EXIT_FAILURE);
     }
 
     subspace_info->buffer_index->next = old_index;
     subspace_info->buffer_index->prev = NULL;
     old_index->prev = subspace_info->buffer_index;
-    // write_buffer_copy(old_index, task->buffer  , last_insert , thread->thread);
 
 
     task->buffered_num = write_buffer_index_to_array(old_index , FlushBlock , last_insert , &task->buffered_key
@@ -1313,7 +1204,6 @@ int flush_write_buffer_to_ssd(struct subspace_info * subspace_info , struct thre
 
     task->subspace_info = subspace_info;
     task->thread = thread;
-    // thread_block_rw[thread->thread] ++;
     task->index_to_free = old_index;
     task->break_down = (void *)break_down;
 
@@ -1329,9 +1219,7 @@ int flush_write_buffer_to_ssd(struct subspace_info * subspace_info , struct thre
         FlushBlock[i] * physical_block_to_logical_block , physical_block_to_logical_block , cb , task , 0);
         if (rc != 0) {
             printf("flush_write_buffer_to_ssd ERROR:starting write I/O failed\n");
-            // qpair_unlock(thread->thread);
             return 0;
-            // }
         }
     }
 
@@ -1418,23 +1306,13 @@ static uint32_t projected_slot_count_after_flush(
 void insert(key_type key , int size , char * value ,  struct thread * thread , struct insert_time_breakdown * break_down){
     const int size_encap = (int)kv_record_size((size_t)size);
     kv_version_type version;
-    // PMEMobjpool * pool;
     struct subspace_info * subspace_info;
     struct write_buffer_return_type buffer_to_free;
-    uint64_t start_time , end_time;
-    // struct subspace_info * new_subspace_info;
-    // key_type new_node_key;
     PMEMoid id;
     uint16_t WBF_seq;
     uint32_t block;
-    // printf("insert key:%lu value:%s start\n" , key , value);
-
-    // printf("insert key:%lu value:%s start\n" , key , value);
-    // start_time = spdk_get_ticks();
     version = kv_record_next_thread_version(&thread->kv_version_next,
                                             &thread->kv_version_limit);
-    // printf("size_encap is %d\n" , size_encap);
-    // printf("write_buffer_insert %d start\n" , key);
     id = write_buffer_insert(key, version, value, size, thread->kvbuffer,
                              &WBF_seq, &(thread->buffer_free_head),
                              thread->thread);
@@ -1442,22 +1320,10 @@ void insert(key_type key , int size , char * value ,  struct thread * thread , s
         printf("write_buffer_insert failed id is NULL\n");
         return ;
     }
-    // end_time = spdk_get_ticks();
-    // insert_breakdown[thread->thread].buffer_insert_time += end_time - start_time;
-
-    // write_buffer_index_check(subspace_info->buffer_index);
-    // printf("hybrid_index_insert %lu start\n" , key);
-    // start_time = spdk_get_ticks();
     subspace_info = hybrid_index_insert(thread->index , key , size_encap , id , WBF_seq , &buffer_to_free , thread->thread);
     if(buffer_to_free.size != 0){
         write_buffer_free(buffer_to_free.id , buffer_to_free.WBF_seq,  buffer_to_free.size ,&(thread->buffer_free_head));
     }
-    // end_time = spdk_get_ticks();
-    // insert_breakdown[thread->thread].index_insert_time += end_time - start_time;
-    // if(key == 6063691547004636268 || g_subspace_info == subspace_info){
-    //     printf("insert 6063691547004636268 buffered_size is %d\n" , subspace_info->buffered_size);
-    //     g_subspace_info = subspace_info;
-    // }
 
     if(subspace_info->buffered_size > (BLOCK_SIZE * Flush_Blcok_Num) &&
        !subspace_info->is_spliting && !subspace_info->is_gc){//触发flush
@@ -1487,21 +1353,10 @@ void insert(key_type key , int size , char * value ,  struct thread * thread , s
                               new_subspace, 0);
             return;
         }
-        // printf("subspace_info->buffered_size is %d\n" , subspace_info->buffered_size);
-        // start_time = spdk_get_ticks();
-        // block = get_free_block(&thread->curr_segment , thread->fs);
-        // printf("insert key %lu flush\n" , key);
-        // block = get_n_free_block(&thread->curr_segment , thread->fs , Flush_Blcok_Num);
         block = 0;
-        // printf("get free block %d\n" , block);
         if(flush_write_buffer_to_ssd(subspace_info , thread , thread->ns_entry , block , flush_cb , key , break_down)){
             subspace_info->buffered_size = 0;
         }
-        // end_time = spdk_get_ticks();
-        // // break_down->spdk_write_time = end_time;
-        // insert_breakdown[thread->thread].flush_time += end_time - start_time;
-        // printf("flush_write_buffer_to_ssd done\n");
-        // printf("insert %d subspace_info->buffered_size is %d get block %d\n" , key , subspace_info->buffered_size , block);
     }
 
     return ;

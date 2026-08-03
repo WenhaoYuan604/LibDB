@@ -14,7 +14,6 @@ struct dram_index_node{
         struct dram_index_node * children[DRAM_INDEX_MAX_NODE];
         struct subspace_info * subspaces[DRAM_INDEX_MAX_NODE];
     };
-// struct dram_index_node * next; // used for leaf node
 };
 
 struct dram_index{
