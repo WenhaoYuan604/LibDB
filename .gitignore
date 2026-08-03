@@ -29,3 +29,7 @@ workloads_unif/
 workloads_zipf/
 warm.txt
 nutanix.txt
+
+# generated artifact data
+artifact/ycsb/generated/
+artifact/ycsb/ycsb-data/

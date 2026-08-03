@@ -1,0 +1,21 @@
+From: LibDB artifact authors
+Subject: [PATCH] Log YCSB scan operations in the generated trace
+
+This file modifies YCSB-tracegen and is distributed under Apache-2.0.
+
+diff --git a/rocksdb/src/main/java/site/ycsb/db/rocksdb/RocksDBClient.java b/rocksdb/src/main/java/site/ycsb/db/rocksdb/RocksDBClient.java
+index 52c6bbf..ba21470 100755
+--- a/rocksdb/src/main/java/site/ycsb/db/rocksdb/RocksDBClient.java
++++ b/rocksdb/src/main/java/site/ycsb/db/rocksdb/RocksDBClient.java
+@@ -264,5 +264,10 @@ public class RocksDBClient extends DB {
++      // LibDB artifact modification: include scans in the generated trace.
++      try (FileWriter fileWriter = new FileWriter("test.txt", true)) {
++        fileWriter.write("S " + startkey + " " + recordcount + "\n");
++      }
++
+       return Status.OK;
+-    } catch(final RocksDBException e) {
++    } catch(final RocksDBException | IOException e) {
+       LOGGER.error(e.getMessage(), e);
+       return Status.ERROR;
+     }

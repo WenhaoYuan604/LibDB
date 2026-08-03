@@ -227,6 +227,25 @@ S user1 10
 
 解析器会把请求数向下取整到 1000 的整数倍，因此 workload 应至少包含 1000 条记录，最好直接生成 1000 的整数倍。
 
+### Generate YCSB A/C/E workloads
+
+仓库不直接保存数 GB 的完整 trace，而是在
+[`artifact/ycsb`](artifact/ycsb/README.md) 中提供生成所需的固定 YCSB-tracegen
+commit、A/C/E 配置、scan trace 补丁和安全的一键脚本。默认生成：
+
+```text
+warm.txt   100M inserts
+ycsba.txt  100M operations, 50% read / 50% update
+ycsbc.txt  100M reads
+ycsbe.txt   20M operations, 95% scan / 5% insert
+```
+
+查看生成器的环境、磁盘空间和快速测试说明：
+
+```bash
+./artifact/ycsb/generate_workloads.sh --help
+```
+
 运行 1 KiB、1000 KV 的 smoke test：
 
 ```bash
@@ -322,7 +341,7 @@ sudo env \
 默认参数为 16 个 server workers、8 个 load injectors、20,000 MiB cache、
 1,024-byte KV、100,000,000 个 KV、每 worker 16 个并行任务。恢复阶段默认
 启用全量重复键检查。脚本只清理
-`/mnt/whypmem/libdb_kvpb_io/libdb_clean_heavy_ac`，A 和 C 均从全新 PMEM
+`<PMEM_BASE>/libdb_clean_heavy_ac`，A 和 C 均从全新 PMEM
 状态开始；C 完成后不会清理，直到 recovery 完成或脚本退出。日志和结果写入
 `results/heavy_ac_<timestamp>/`。
 
@@ -362,6 +381,7 @@ LIBDB_ALLOW_DESTRUCTIVE=1 \
 ├── CMakeLists.txt
 ├── README.md
 ├── config.h / config.c
+├── artifact/ycsb/              # pinned YCSB A/C/E trace generator
 ├── run_example.sh
 ├── main.c / base.c / base.h
 ├── client.c / server.c / task.c
