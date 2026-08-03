@@ -458,53 +458,118 @@ void kvcache_delete(kvcache * cache , lru_list *list, key_type key){
     return;
 }
 
-void kvcache_on_demand_refresh(char * buffer , struct address_type * addr , int num ,
- key_type * key , struct kvcache * cache){
-    int off = 0;
-    skipnode * curr;
+static void kvcache_unlink_and_free_node(lru_list *list, skipnode *node){
+    if(list == NULL || node == NULL || node->head == NULL){
+        return;
+    }
 
-    curr = cache->head;
-    for (int j = cache->current_level-1; j >= 0; j--) {
-        while (curr->forward[j] && curr->forward[j]->key < key[0]) {
-            curr = curr->forward[j];
+    skipnode *head = node->head;
+    for(int level = head->level - 1; level >= 0; level--){
+        skipnode *prev = head;
+        while(prev->forward[level] && prev->forward[level]->key < node->key){
+            prev = prev->forward[level];
+        }
+        if(prev->forward[level] == node){
+            prev->forward[level] = node->forward[level];
         }
     }
-    curr = curr->forward[0];
 
-    for(int i = 0 ; i < num ; i++){
-        off = addr[i].off;
-        if(!curr){
-            return ;
-        }
-
-        for (int j = curr->level - 1; curr && j >= 0; j--) {
-            while (curr->forward[j] && curr->forward[j]->key < key[i]) {
-                curr = curr->forward[j];
-            }
-
-            if(curr->forward[j] && curr->forward[j]->key == key[i]){//cache命中
-                curr = curr->forward[j];
-                struct kv_record_view view;
-                if(kv_record_decode_for_key(buffer + off, addr[i].size,
-                                            key[i], &view) != 0){
-                    fprintf(stderr, "fatal: invalid KV record while refreshing cache for key %lu\n",
-                            (unsigned long)key[i]);
-                    exit(EXIT_FAILURE);
-                }
-                if(curr->length != (int)view.value_size){//变长
-                    free(curr->value);
-                    curr->value = (char *)malloc(view.value_size);
-                    curr->length = view.value_size;
-                }
-                if(kv_record_copy_valid_value(curr->value,
-                                              view.value_size, &view) != 0){
-                    fprintf(stderr,
-                            "fatal: failed to copy valid SSD value prefix into cache\n");
-                    exit(EXIT_FAILURE);
-                }
-                break;
-            }
-        }
+    if(node->lru_prev){
+        node->lru_prev->lru_next = node->lru_next;
     }
-    return ;
+    else{
+        list->lru_head = node->lru_next;
+    }
+    if(node->lru_next){
+        node->lru_next->lru_prev = node->lru_prev;
+    }
+    else{
+        list->lru_tail = node->lru_prev;
+    }
+    if(list->size >= (size_t)node->length){
+        list->size -= (size_t)node->length;
+    }
+    else{
+        list->size = 0;
+    }
+
+    free(node->value);
+    free(node->forward);
+    free(node);
+}
+
+int kvcache_refresh_after_flush(kvcache *cache, lru_list *list,
+                                const char *buffer, size_t buffer_size,
+                                const struct address_type *addr,
+                                const key_type *keys, int num_keys){
+    if(cache == NULL || cache->head == NULL || list == NULL ||
+       buffer == NULL || addr == NULL || keys == NULL || num_keys < 0){
+        return -1;
+    }
+    if(num_keys == 0){
+        return 0;
+    }
+
+    skipnode *cached = cache->head->forward[0];
+    size_t packed_offset = 0;
+    int refreshed = 0;
+
+    for(int i = 0; i < num_keys; i++){
+        if(i > 0 && keys[i] <= keys[i - 1]){
+            return -1;
+        }
+        if(addr[i].size <= 0 || addr[i].size > (int)BLOCK_SIZE){
+            return -1;
+        }
+
+        size_t record_size = (size_t)addr[i].size;
+        size_t block_offset = packed_offset % BLOCK_SIZE;
+        if(block_offset != 0 && block_offset + record_size > BLOCK_SIZE){
+            packed_offset += BLOCK_SIZE - block_offset;
+        }
+        if(packed_offset > buffer_size ||
+           record_size > buffer_size - packed_offset ||
+           addr[i].off != (int)(packed_offset % BLOCK_SIZE)){
+            return -1;
+        }
+
+        while(cached != NULL && cached->key < keys[i]){
+            cached = cached->forward[0];
+        }
+        if(cached != NULL && cached->key == keys[i]){
+            struct kv_record_view view;
+            if(kv_record_decode_for_key(buffer + packed_offset, record_size,
+                                        keys[i], &view) != 0){
+                return -1;
+            }
+
+            char *new_value = (char *)malloc(view.value_size);
+            if(new_value == NULL ||
+               kv_record_copy_valid_value(new_value, view.value_size, &view) != 0){
+                free(new_value);
+                return -1;
+            }
+
+            if(list->size >= (size_t)cached->length){
+                list->size -= (size_t)cached->length;
+            }
+            else{
+                list->size = 0;
+            }
+            list->size += view.value_size;
+            free(cached->value);
+            cached->value = new_value;
+            cached->length = (int)view.value_size;
+            cached = cached->forward[0];
+            refreshed++;
+        }
+
+        packed_offset += record_size;
+    }
+
+    /* A variable-size update may grow an existing cached value. */
+    while(list->size > list->capacity && list->lru_tail != NULL){
+        kvcache_unlink_and_free_node(list, list->lru_tail);
+    }
+    return refreshed;
 }

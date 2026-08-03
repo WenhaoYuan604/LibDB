@@ -1070,6 +1070,22 @@ void flush_cb(void *arg, const struct spdk_nvme_cpl *completnio){
         exit(EXIT_FAILURE);
     }
 
+    /*
+     * The item index now publishes the newly flushed SSD records.  Refresh any
+     * matching cache entries before unlinking the frozen GWB index; otherwise a
+     * subsequent lookup could miss the GWB and return the previously cached
+     * SSD value.  The refresh is a linear merge over the ordered cache and
+     * ordered flush batch and intentionally does not change LRU recency.
+     */
+    if(kvcache_refresh_after_flush(
+           subspace_info->kvcache, thread->lru_list, task->buffer,
+           (size_t)task->total_block_num * BLOCK_SIZE,
+           (const struct address_type *)task->buffered_addr,
+           task->buffered_key, task->buffered_num) < 0){
+        fprintf(stderr, "fatal: failed to refresh cache after flush\n");
+        exit(EXIT_FAILURE);
+    }
+
 
     if(old_index == NULL){
         printf("ERROR:flush_cb old_index = NULL\n");

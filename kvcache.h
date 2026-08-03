@@ -59,7 +59,15 @@ int * value_size, int num_keys,  int *cache_hits , int * buffer_hit , int thread
 
 void kvcache_delete(kvcache * cache , lru_list *list, key_type key);
 
-void kvcache_on_demand_refresh(char * buffer , struct address_type * addr , int num ,
- key_type * key , struct kvcache * cache);
+/*
+ * Refresh only cache entries that already exist for a completed flush batch.
+ * keys and records in buffer must use the same ascending-key, block-aligned
+ * packing order produced by write_buffer_copy/write_buffer_index_to_array.
+ * Returns the number of refreshed entries, or -1 when the batch is invalid.
+ */
+int kvcache_refresh_after_flush(kvcache *cache, lru_list *list,
+                                const char *buffer, size_t buffer_size,
+                                const struct address_type *addr,
+                                const key_type *keys, int num_keys);
 
 #endif
