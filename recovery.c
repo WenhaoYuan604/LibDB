@@ -1413,7 +1413,10 @@ static void recovery_rebuild_wb_for_thread(struct db *db, int t, uint64_t *out_e
                     seg_owner_t = key_to_thread(seg_key, db);
                     break;
                 }
-                if(ok0 == -1 || ok0 == 0){
+                if(ok0 == -1){
+                    continue; /* freed slot; later fixed-size slots may be live */
+                }
+                if(ok0 == 0){
                     break;
                 }
             }
@@ -1428,7 +1431,7 @@ static void recovery_rebuild_wb_for_thread(struct db *db, int t, uint64_t *out_e
                 kv_version_type version;
                 int ok = wbf_entry_parse_sane(seg_base + off, q_size, &key, &entry_size, &version);
                 if(ok == -1){
-                    break;
+                    continue; /* key_size=0 marks only this slot invalid */
                 }
                 if(ok == 0){
                     break;
@@ -1449,7 +1452,7 @@ static void recovery_rebuild_wb_for_thread(struct db *db, int t, uint64_t *out_e
                 id.off += (uint64_t)off;
 
                 int install_rc = recovery_wbf_install_latest(
-                    ss, key, entry_size, id, 0 /* WBF_seq */, version);
+                    ss, key, entry_size, id, (uint16_t)file_i, version);
                 if(install_rc < 0){
                     exit(EXIT_FAILURE);
                 }
@@ -1835,7 +1838,7 @@ static int wbf_entry_parse_sane(const char *p, int q_size, key_type *key_out,
     uint16_t key_size;
     memcpy(&key_size, p, sizeof(key_size));
     if(key_size == 0){
-        return -1; /* empty slot: caller may stop scanning this segment */
+        return -1; /* invalid/freed slot: caller must continue this segment */
     }
     struct kv_record_view view;
     if(kv_record_decode(p, (size_t)q_size, &view) != 0 ||
@@ -1897,7 +1900,10 @@ static void recovery_rebuild_wb_worker(void *arg){
                     seg_owner_t = key_to_thread(seg_key, db);
                     break;
                 }
-                if(ok0 == -1 || ok0 == 0){
+                if(ok0 == -1){
+                    continue; /* freed slot; later fixed-size slots may be live */
+                }
+                if(ok0 == 0){
                     break;
                 }
             }
@@ -1912,7 +1918,7 @@ static void recovery_rebuild_wb_worker(void *arg){
                 kv_version_type version;
                 int ok = wbf_entry_parse_sane(seg_base + off, q_size, &key, &entry_size, &version);
                 if(ok == -1){
-                    break;
+                    continue; /* key_size=0 marks only this slot invalid */
                 }
                 if(ok == 0){
                     break;

@@ -44,6 +44,7 @@ PMEMoid write_buffer_insert(key_type key, kv_version_type version,
  const char *value, int value_size, struct write_buffer *write_buffer,
  uint16_t *WBF_seq, struct write_buffer_free_node **free_list_head, int thread);
 
+/* Persist key_size=0 before returning the allocation unit to the DRAM free list. */
 int write_buffer_free(PMEMoid id , uint16_t WBF_seq , int size, struct write_buffer_free_node ** free_list_head);
 
 

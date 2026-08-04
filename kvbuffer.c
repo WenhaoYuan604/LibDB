@@ -239,13 +239,44 @@ PMEMoid write_buffer_insert(key_type key, kv_version_type version,
 
 int write_buffer_free(PMEMoid id , uint16_t WBF_seq , int size, struct write_buffer_free_node ** free_list_head){
     int q_size = WBF_SLOT_MIN_SIZE;
-    struct write_buffer_free_node * node = (struct write_buffer_free_node *)malloc(sizeof(struct write_buffer_free_node));
-    if(node == NULL){
-        printf("fail to malloc in func write_buffer_free\n");
+    if(OID_IS_NULL(id) || free_list_head == NULL){
         return 0;
     }
     while(q_size < size){
         q_size *= 2;
+    }
+
+    /*
+     * Persistently retire the record before publishing its allocation unit to
+     * the volatile free list.  Recovery scans fixed q_size slots and treats a
+     * zero key_size as an invalid/freed record, so a completed flush or a
+     * replacement cannot resurrect this old GWB entry after a crash.
+     */
+    PMEMobjpool *pool = pmemobj_pool_by_oid(id);
+    char *record = (char *)pmemobj_direct(id);
+    if(pool == NULL || record == NULL){
+        fprintf(stderr, "write_buffer_free: invalid PMEM record\n");
+        return 0;
+    }
+    uint16_t current_key_size = 0;
+    memcpy(&current_key_size, record, sizeof(current_key_size));
+    if(current_key_size != sizeof(key_type)){
+        fprintf(stderr,
+                "write_buffer_free: record is already invalid or corrupt "
+                "(key_size=%u)\n",
+                (unsigned int)current_key_size);
+        return 0;
+    }
+    const uint16_t invalid_key_size = 0;
+    memcpy(record, &invalid_key_size, sizeof(invalid_key_size));
+    pmemobj_persist(pool, record, sizeof(invalid_key_size));
+
+    struct write_buffer_free_node * node =
+        (struct write_buffer_free_node *)malloc(sizeof(struct write_buffer_free_node));
+    if(node == NULL){
+        /* The record stays durably invalid even if it cannot be reused now. */
+        printf("fail to malloc in func write_buffer_free\n");
+        return 0;
     }
 
     node->buffer = id;
