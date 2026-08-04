@@ -186,8 +186,9 @@ struct thread * initialize_recovery(struct db * db){
 
     printf("initialize_recovery start\n");
 
-    struct timespec ts_total0, ts_total1;
+    struct timespec ts_total0, ts_recovery1;
     struct timespec ts_init0, ts_init1;
+    struct timespec ts_check0, ts_check1;
     clock_gettime(CLOCK_MONOTONIC, &ts_total0);
     ts_init0 = ts_total0;
 
@@ -231,16 +232,22 @@ struct thread * initialize_recovery(struct db * db){
     t_wb0 = t_index1;
     t_fs0 = t_wb1;
 
+    /* Recovery ends here.  Optional diagnostic checks are timed separately. */
+    clock_gettime(CLOCK_MONOTONIC, &ts_recovery1);
+
+    double check_sec = 0.0;
     if(db->recovery_dupcheck){
+        clock_gettime(CLOCK_MONOTONIC, &ts_check0);
         if(!recovery_report_duplicate_keys(db)){
             fprintf(stderr , "recovery_report_duplicate_keys 失败（如内存不足）；未得到重复键统计\n");
         }
+        clock_gettime(CLOCK_MONOTONIC, &ts_check1);
+        check_sec = (double)(ts_check1.tv_sec - ts_check0.tv_sec) +
+                    (double)(ts_check1.tv_nsec - ts_check0.tv_nsec) / 1e9;
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &ts_total1);
-
-    double total_sec = (double)(ts_total1.tv_sec - ts_total0.tv_sec) +
-                       (double)(ts_total1.tv_nsec - ts_total0.tv_nsec) / 1e9;
+    double total_sec = (double)(ts_recovery1.tv_sec - ts_total0.tv_sec) +
+                       (double)(ts_recovery1.tv_nsec - ts_total0.tv_nsec) / 1e9;
     double init_sec = (double)(ts_init1.tv_sec - ts_init0.tv_sec) +
                       (double)(ts_init1.tv_nsec - ts_init0.tv_nsec) / 1e9;
 
@@ -251,10 +258,19 @@ struct thread * initialize_recovery(struct db * db){
 
     printf("recovery timing: total=%.6fs recovery_init=%.6fs rebuild_index=%.6fs rebuild_write_buffer=%.6fs rebuild_freespace=%.6fs\n",
            total_sec, init_sec, index_sec, wb_sec, fs_sec);
+    if(db->recovery_dupcheck){
+        printf("recovery check timing (excluded from total): duplicate_key_check=%.6fs\n",
+               check_sec);
+    }
     if(db->output_fp){
         fprintf(db->output_fp,
                 "recovery timing: total=%.6fs recovery_init=%.6fs rebuild_index=%.6fs rebuild_write_buffer=%.6fs rebuild_freespace=%.6fs\n",
                 total_sec, init_sec, index_sec, wb_sec, fs_sec);
+        if(db->recovery_dupcheck){
+            fprintf(db->output_fp,
+                    "recovery check timing (excluded from total): duplicate_key_check=%.6fs\n",
+                    check_sec);
+        }
         fflush(db->output_fp);
     }
 
