@@ -26,6 +26,7 @@ struct nvm_index * nvm_index_initialize();
 struct nvm_index * nvm_index_open_existing();
 
 PMEMoid nvm_index_get_free_node(struct nvm_index * nvm_index ,struct nvm_index_free_node ** free_list_head , PMEMobjpool ** pool);
+void nvm_index_recycle_slot(struct nvm_index *index, struct nvm_index_free_node **head, PMEMoid slot);
 int nvm_index_reserve_free_nodes(struct nvm_index *nvm_index,
                                  struct nvm_index_free_node **free_list_head,
                                  uint32_t required);

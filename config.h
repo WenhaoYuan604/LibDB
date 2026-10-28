@@ -25,7 +25,15 @@
 /* Flush, subspace, slot, and free-space group layout. */
 #define LIBDB_FLUSH_BLOCK_COUNT                 4
 #define LIBDB_LNF_SLOT_SIZE                     256U
+#ifndef LIBDB_SUBSPACE_MAX_KEYS
 #define LIBDB_SUBSPACE_MAX_KEYS                 128U
+#endif
+#ifndef LIBDB_SUBSPACE_MERGE_LOWER_THRESHOLD
+#define LIBDB_SUBSPACE_MERGE_LOWER_THRESHOLD (LIBDB_SUBSPACE_MAX_KEYS / 2U)
+#endif
+_Static_assert(LIBDB_SUBSPACE_MERGE_LOWER_THRESHOLD > 0 &&
+               LIBDB_SUBSPACE_MERGE_LOWER_THRESHOLD <= LIBDB_SUBSPACE_MAX_KEYS,
+               "invalid group merge threshold");
 /* A slot stores one boundary key followed by key-to-SSD-address entries. */
 #define LIBDB_LNF_SLOT_ENTRY_CAPACITY           \
     ((LIBDB_LNF_SLOT_SIZE - sizeof(key_type)) / sizeof(struct slot_element))
@@ -36,10 +44,29 @@
 #define LIBDB_SUBSPACE_MAX_SLOTS                \
     (((2U * LIBDB_SUBSPACE_MAX_KEYS) + LIBDB_LNF_SLOT_ENTRY_CAPACITY - 1U) / \
      LIBDB_LNF_SLOT_ENTRY_CAPACITY)
-#define LIBDB_SUBSPACE_REDUNDANT_THRESHOLD      0.3
+#define LIBDB_SUBSPACE_REDUNDANT_THRESHOLD      0.30
+#define LIBDB_SUBSPACE_REDUNDANT_FRACTION \
+    (LIBDB_SUBSPACE_REDUNDANT_THRESHOLD / \
+     (1.0 + LIBDB_SUBSPACE_REDUNDANT_THRESHOLD))
+#define LIBDB_GC_RELAXED_THRESHOLD 0.55
+#define LIBDB_GC_SPACE_LIMIT 1.30
+#define LIBDB_GC_POLL_NS UINT64_C(100000000)
 #define LIBDB_FREE_SPACE_GROUP_BLOCKS           1024
 /* Reserved lower-fence marker for an interrupted persistent group split. */
 #define LIBDB_INVALID_GROUP_BOUNDARY             UINT64_MAX
+
+/* Dynamic flush applies only to the measured workload. Soft occupancy limit. */
+#ifndef LIBDB_DYNAMIC_FLUSH_ENABLED
+#define LIBDB_DYNAMIC_FLUSH_ENABLED 1
+#endif
+#ifndef LIBDB_NVM_FLUSH_LIMIT_BYTES
+#define LIBDB_NVM_FLUSH_LIMIT_BYTES (UINT64_C(16) * 1024 * 1024 * 1024)
+#endif
+#ifndef LIBDB_NVM_FLUSH_POLL_NS
+#define LIBDB_NVM_FLUSH_POLL_NS UINT64_C(100000000)
+#endif
+_Static_assert(LIBDB_NVM_FLUSH_LIMIT_BYTES > 0, "NVM flush limit must be positive");
+_Static_assert(LIBDB_NVM_FLUSH_POLL_NS > 0, "NVM poll interval must be positive");
 
 /* Persistent write-buffer files. */
 #define LIBDB_WBF_FILE_SIZE                     (1ULL * 1024 * 1024 * 1024)

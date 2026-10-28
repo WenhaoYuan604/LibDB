@@ -432,30 +432,33 @@ void kvcache_split(kvcache *cache, kvcache *new_cache, key_type boundary) {
     return ;
 }
 
-void kvcache_delete(kvcache * cache , lru_list *list, key_type key){
-    skipnode *curr = cache->head;
-    skipnode *update[MAX_LEVEL];
-    // 跳表查找
-    for (int i = cache->current_level-1; i >= 0; i--) {
-        while (curr->forward[i] && curr->forward[i]->key < key)
-            curr = curr->forward[i];
-        update[i] = curr;
-    }
-    curr = curr->forward[0];
+static void kvcache_unlink_and_free_node(lru_list *list, skipnode *node);
+void kvcache_delete(kvcache *cache, lru_list *list, key_type key){
+    skipnode *node = cache->head;
+    for(int i = cache->current_level - 1; i >= 0; i--)
+        while(node->forward[i] && node->forward[i]->key < key) node = node->forward[i];
+    node = node->forward[0];
+    if(node && node->key == key) kvcache_unlink_and_free_node(list, node);
+}
 
-    if (curr && curr->key == key) {
-        for(int i = 0 ; i < curr->level ; i++){
-            update[i]->forward[i] = curr->forward[i];
-        }
-        if(curr->lru_prev){
-            curr->lru_prev->lru_next = curr->lru_next;
-        }
-        if(curr->lru_next){
-            curr->lru_next->lru_prev = curr->lru_prev;
-        }
-        return;
+void kvcache_merge(kvcache *left, kvcache *right){
+    for(skipnode *n = right->head->forward[0]; n; n = n->forward[0]) n->head = left->head;
+    for(int i = 0; i < right->current_level; i++){
+        skipnode *tail = left->head;
+        while(tail->forward[i]) tail = tail->forward[i];
+        tail->forward[i] = right->head->forward[i];
+        right->head->forward[i] = NULL;
     }
-    return;
+    if(left->current_level < right->current_level) left->current_level = right->current_level;
+    left->head->level = left->current_level;
+}
+
+void kvcache_destroy_empty(kvcache *cache){
+    assert(!cache->head->forward[0]);
+    free(cache->head->value);
+    free(cache->head->forward);
+    free(cache->head);
+    free(cache);
 }
 
 static void kvcache_unlink_and_free_node(lru_list *list, skipnode *node){

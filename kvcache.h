@@ -49,6 +49,9 @@ void kvcache_insert(kvcache *cache, lru_list *list , key_type key, const char* v
 void kvcache_insert_emulation(kvcache *cache, lru_list *list, key_type key, const char* value,
 int length, int thread);
 
+void kvcache_merge(kvcache *left, kvcache *right);
+void kvcache_destroy_empty(kvcache *cache);
+
 void kvcache_split(kvcache *cache, kvcache *new_cache, key_type boundary);
 
 uint64_t kvcache_get_batch(kvcache *cache , lru_list *list , key_type *keys, char **values,

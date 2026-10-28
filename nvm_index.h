@@ -34,7 +34,8 @@ int nvm_index_insert_after_flush(struct subspace_info * subspace_info , struct n
 key_type * buffer_key , struct address_type * buffered_addr ,int buffered_num , struct nvm_index_free_node ** free_list_head);
 
 
-void nvm_index_delete(struct subspace_info * subspace_info ,key_type key);
+struct thread;
+bool nvm_index_delete(struct subspace_info *group, key_type key, struct thread *thread);
 
 #endif
 #endif /* C38687D3_0F09_4FFA_881C_01C4090B36F5 */

@@ -9,10 +9,16 @@
 #include "./spdk_struct.h"
 #include "./garbadge_c.h"
 #include "base.h"
+#include "space_stats.h"
 #include "./kvcache.h"
 #include "spdk/env.h"
 
 struct db{
+    struct initial_load_stats initial_load;
+    struct gc_space_control gc_space;
+    struct nvm_flush_control nvm_flush;
+    uint64_t data_blocks;
+    struct thread *workers;
     int thread;
     int load_injectors;
     int boundary_size;
@@ -55,6 +61,8 @@ struct thread * initialize(struct db * db);
 
 struct thread * initialize_recovery(struct db * db);
 
+
+bool subspace_maybe_flush(struct subspace_info *group, struct thread *thread);
 
 void insert(key_type key , int size , char * value ,  struct thread * thread , struct insert_time_breakdown * break_down);
 

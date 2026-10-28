@@ -308,6 +308,7 @@ struct free_space * initialize_freespace(int block_num){
 			return 0;
 		}
 		memset(g_map, 0, sizeof(uint_fast8_t) * block_num);
+		atomic_store(&g_used_data_blocks, 0);
 	}
 	g_block_num = block_num;
 	printf("segment_num is %d\n" , segment_num);
@@ -363,6 +364,7 @@ struct free_space * initialize_freespace_recovery(int block_num){
 		}
 	}
 	memset(g_map, 0, sizeof(uint_fast8_t) * block_num);
+    atomic_store(&g_used_data_blocks, 0);
 	g_block_num = block_num;
 
 	if(pthread_mutex_init(&g_mutex_lock , NULL) != 0){
@@ -378,6 +380,7 @@ struct segment * get_free_segment(struct free_space * fs){
 	struct segment * segment;
 	pthread_mutex_lock(&g_mutex_lock);
 	if(fs->head == NULL){
+		pthread_mutex_unlock(&g_mutex_lock);
 		printf("no free segment available\n");
 		return NULL;
 	}
@@ -394,13 +397,13 @@ int get_free_block(struct segment ** segment_p , struct free_space * fs){
     int block;
 	struct segment * segment = * segment_p;
 
-    if( segment->cur == alloc_grain ){
-        *segment_p = get_free_segment(fs);
-		segment = * segment_p;
-        if(segment == NULL){
-            printf("ERROR:segment is NULL\n");
+    if(segment == NULL || segment->cur == alloc_grain){
+        struct segment *next = get_free_segment(fs);
+        if(next == NULL){
+            /* Keep the exhausted segment available for allocation rollback. */
             return -1;
         }
+        *segment_p = segment = next;
     }
     block = segment->block_array[segment->cur];
     segment->cur ++ ;
@@ -469,7 +472,7 @@ void free_block(uint32_t * block_array , int block_num ,  struct segment ** segm
 		while(block_num > 0 && (*segment_p)->cur > 0){
 			block_num--;
 			(*segment_p)->cur--;
-			g_map[block_array[block_num]] = 0;
+			block_ref_clear(block_array[block_num]);
 			(*segment_p)->block_array[(*segment_p)->cur] = block_array[block_num];
 		}
 		if((*segment_p)->cur == 0 && block_num > 0){

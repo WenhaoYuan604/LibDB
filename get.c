@@ -77,8 +77,12 @@ void get_cb(void *ctx, const struct spdk_nvme_cpl *cpl) {
     }
 
     debug_dump_kv_header("SSD-buffer", task->key, record, task->addr.size);
-    kvcache_insert(subspace_info->kvcache, thread->lru_list, task->key,
-                   result, view.value_size, thread->thread);
+    if(read_cache_mapping_current(thread, task->key, task->addr)){
+        struct subspace_info *current = dram_index_search(thread->index->dram_index, task->key, NULL, NULL);
+        kvcache_insert(current->kvcache, thread->lru_list, task->key, result, view.value_size, thread->thread);
+    }
+    read_unpin_blocks(thread, &task->addr.block, 1);
+    subspace_unref(subspace_info);
     server_submit_result(task->key, result, view.value_size, 0, 0,
         thread->spdk_result_ring[task->key % thread->db->load_injectors],
         task->start, task->break_down);
@@ -165,12 +169,14 @@ struct read_time_breakdown * break_down){
             int qpair_excuting_once , rc ;
             int qpair_num = thread->thread % ctr_max_qp;
 
+            subspace_ref(subspace_info);
+            read_pin_blocks(thread, &addr.block, 1);
             task = get_free_task(thread->ns_entry , thread->thread);
 
             while(task == NULL){//qpair已满
                 if((qpair_excuting_once = spdk_nvme_qpair_process_completions(thread->ns_entry->qpair[qpair_num], 0)) < 0){
-                    printf("ERROR:fail to process_completions qpair[%d]\n" , qpair_num);
-                    return 0;
+                    fprintf(stderr, "get: completion processing failed\n");
+                    exit(EXIT_FAILURE);
                 }
                 if(qpair_excuting_once != 0){
                     task = get_free_task(thread->ns_entry , thread->thread);
@@ -188,8 +194,8 @@ struct read_time_breakdown * break_down){
             rc = spdk_nvme_ns_cmd_read(thread->ns_entry->ns, thread->ns_entry->qpair[qpair_num], task->buffer, addr.block * physical_block_to_logical_block,
                 physical_block_to_logical_block, get_cb , task , 0);
             if (rc != 0) {
-                printf("ERROR:starting read I/O failed\n");
-                return 0;
+                fprintf(stderr, "get: read submission failed\n");
+                exit(EXIT_FAILURE);
             }
             *size_o = addr.size;
         }
@@ -197,17 +203,27 @@ struct read_time_breakdown * break_down){
     return NULL;
 }
 
-void db_delete(key_type key , struct thread * thread ){
-    struct subspace_info * subspace_info;
-
-
-    subspace_info = dram_index_search(thread->index->dram_index , key , NULL , NULL);
-
-    write_buffer_index_delete(subspace_info->buffer_index , key , NULL);
-
-    kvcache_delete(subspace_info->kvcache , thread->lru_list , key);
-
-    nvm_index_delete(subspace_info , key);
-
-    return ;
+void db_delete(key_type key, struct thread *thread){
+    struct subspace_info *group;
+    for(;;){
+        group = dram_index_search(thread->index->dram_index, key, NULL, NULL);
+        if(!group) return;
+        if(!subspace_busy(group)) break;
+        if(spdk_nvme_qpair_process_completions(thread->ns_entry->qpair[thread->thread % ctr_max_qp], 0) < 0){
+            fprintf(stderr, "delete: failed to wait for structural I/O\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+    struct write_buffer_index_node *node = write_buffer_index_search(group->buffer_index, key);
+    if(node){
+        if(!write_buffer_free(thread->kvbuffer, node->id, node->WBF_seq, node->size, &thread->buffer_free_head)){
+            fprintf(stderr, "delete: failed to retire buffered record\n");
+            exit(EXIT_FAILURE);
+        }
+        group->buffered_size -= node->size;
+        write_buffer_index_delete(group->buffer_index, key, false);
+    }
+    kvcache_delete(group->kvcache, thread->lru_list, key);
+    nvm_index_delete(group, key, thread);
+    merge_check_after_delete(thread, key);
 }

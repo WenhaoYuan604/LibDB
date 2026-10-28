@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 #ifndef BASE_H_
 #define BASE_H_
 #include "config.h"
@@ -26,7 +27,7 @@
 #define RING_IS_EMPTY( m ) ((m)->server_ring_head == (m)->server_ring_tail)
 #define RESULT_RING_IS_EMPTY( m ) ((m)->result_ring_head == ( m )->result_ring_tail)
 
-int benchmark_completed ;
+atomic_int benchmark_completed;
 
 int ** boundary_signal;
 
@@ -68,6 +69,30 @@ uint64_t * thread_split_block_write;
 
 uint_fast8_t * g_map;
 uint64_t g_block_num;
+/* Blocks are worker-owned; only this aggregate is shared with main. */
+_Atomic uint64_t g_used_data_blocks;
+static inline void block_ref_add(uint32_t block) {
+    if(g_map[block]++ == 0)
+        atomic_fetch_add_explicit(&g_used_data_blocks, 1, memory_order_relaxed);
+}
+static inline void block_ref_remove(uint32_t block) {
+    if(--g_map[block] == 0)
+        atomic_fetch_sub_explicit(&g_used_data_blocks, 1, memory_order_relaxed);
+}
+static inline void block_ref_clear(uint32_t block) {
+    if(g_map[block]) {
+        g_map[block] = 0;
+        atomic_fetch_sub_explicit(&g_used_data_blocks, 1, memory_order_relaxed);
+    }
+}
+
+/* Recovery only, before workers start. */
+static inline void block_ref_recount(void) {
+    uint64_t used = 0;
+    for(uint64_t i = 0; i < g_block_num; i++) used += g_map[i] != 0;
+    atomic_store_explicit(&g_used_data_blocks, used, memory_order_relaxed);
+}
+
 
 uint64_t * thread_split_block_rw;
 uint64_t * thread_kvcache_hit;

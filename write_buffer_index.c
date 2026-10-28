@@ -255,7 +255,7 @@ void write_buffer_index_check(struct subspace_info * subspace_info) {
             if (current->key < prev_key) {
                 printf("  错误: 第 %d 层键顺序混乱: 前一个键 %d %lu > 当前键 %d %lu 当前结点的forward[0] %p\n",level,  i-1 ,prev_key,
                  i, current->key , current->forward[0]);
-                printf(" 当前子空间buffer size是 %d\n",subspace_info->buffered_size);
+                printf(" 当前子空间buffer size是 %llu\n", (unsigned long long)subspace_info->buffered_size);
                 sleep(10000);
                 exit(EXIT_FAILURE);
             }
@@ -264,7 +264,7 @@ void write_buffer_index_check(struct subspace_info * subspace_info) {
             if (current->forward == NULL) {
                 printf("  错误: 节点%d %p (键=%lu) 的 forward 数组为空\n", i,
                        current, current->key);
-                printf(" 当前子空间buffer size是 %d\n",subspace_info->buffered_size);
+                printf(" 当前子空间buffer size是 %llu\n", (unsigned long long)subspace_info->buffered_size);
                 sleep(10000);
                 exit(EXIT_FAILURE);
                 break;
@@ -274,4 +274,56 @@ void write_buffer_index_check(struct subspace_info * subspace_info) {
         }
 
     }
+}
+
+/* Both ranges are disjoint, left strictly precedes right. Transfer ownership. */
+void write_buffer_index_merge(struct write_buffer_index *left, struct write_buffer_index *right){
+    if(left->reserve_levels < right->levels){
+        size_t old = left->reserve_levels;
+        left->head->forward = realloc(left->head->forward, right->levels * sizeof(*left->head->forward));
+        if(!left->head->forward) abort();
+        memset(left->head->forward + old, 0, (right->levels - old) * sizeof(*left->head->forward));
+        left->reserve_levels = right->levels;
+    }
+    for(size_t i = 0; i < right->levels; i++){
+        struct write_buffer_index_node *tail = left->head;
+        while(tail->forward[i]) tail = tail->forward[i];
+        tail->forward[i] = right->head->forward[i];
+        right->head->forward[i] = NULL;
+    }
+    if(left->levels < right->levels) left->levels = right->levels;
+}
+
+struct write_buffer_index *write_buffer_index_take_prefix(struct write_buffer_index *index, size_t max_keys, size_t max_bytes){
+    struct write_buffer_index_node *last = NULL;
+    size_t bytes = 0, keys = 0;
+    for(struct write_buffer_index_node *n = index->head->forward[0]; n && keys < max_keys; n = n->forward[0]){
+        size_t padded = bytes;
+        if(bytes % BLOCK_SIZE + n->size > BLOCK_SIZE)
+            padded += BLOCK_SIZE - bytes % BLOCK_SIZE;
+        if(n->size > BLOCK_SIZE || padded + n->size > max_bytes) break;
+        bytes = padded + n->size;
+        last = n;
+        keys++;
+    }
+    if(!last) return NULL;
+    struct write_buffer_index *prefix = malloc(sizeof(*prefix));
+    if(!prefix) return NULL;
+    write_buffer_index_init(prefix);
+    free(prefix->head->forward);
+    prefix->reserve_levels = index->reserve_levels;
+    prefix->levels = index->levels;
+    prefix->head->forward = calloc(prefix->reserve_levels, sizeof(*prefix->head->forward));
+    if(!prefix->head->forward) abort();
+    key_type fence = last->key;
+    for(size_t i = 0; i < index->levels; i++){
+        struct write_buffer_index_node *tail = index->head;
+        while(tail->forward[i] && tail->forward[i]->key <= fence) tail = tail->forward[i];
+        if(tail != index->head){
+            prefix->head->forward[i] = index->head->forward[i];
+            index->head->forward[i] = tail->forward[i];
+            tail->forward[i] = NULL;
+        }
+    }
+    return prefix;
 }

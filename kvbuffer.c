@@ -54,6 +54,8 @@ static PMEMobjpool * write_buffer_file_open(int file_seq){
 
 struct write_buffer * write_buffer_initialize(){
     struct write_buffer * write_buffer = (struct write_buffer *)malloc(sizeof(struct write_buffer));
+    if(!write_buffer) return NULL;
+    atomic_init(&write_buffer->used_slot_bytes, 0);
     write_buffer->file_num = 0;
 
     write_buffer->pool[0] = write_buffer_file_new(0);
@@ -78,6 +80,7 @@ struct write_buffer * write_buffer_open_existing(){
     if(write_buffer == NULL){
         return NULL;
     }
+    atomic_init(&write_buffer->used_slot_bytes, 0);
     write_buffer->file_num = 0;
     for(uint32_t i = 0 ; i < MAX_FILE_NUM ; i++){
         PMEMobjpool * pool = write_buffer_file_open(i);
@@ -90,12 +93,48 @@ struct write_buffer * write_buffer_open_existing(){
         free(write_buffer);
         return NULL;
     }
+    if(!write_buffer_rebuild_occupancy(write_buffer)){
+        fprintf(stderr, "recovery: invalid write-buffer occupancy metadata\n");
+        for(uint32_t i = 0; i < write_buffer->file_num; i++) pmemobj_close(write_buffer->pool[i]);
+        free(write_buffer);
+        return NULL;
+    }
     if(pthread_mutex_init(&g_mutex_lock_wbs , NULL) != 0){
         printf("ERROR:fail to init g_mutex_lock_wbs\n");
         free(write_buffer);
         return NULL;
     }
     return write_buffer;
+}
+
+int write_buffer_rebuild_occupancy(struct write_buffer *write_buffer){
+    if(!write_buffer || write_buffer->file_num > MAX_FILE_NUM) return 0;
+    uint64_t bytes = 0;
+    for(uint32_t f = 0; f < write_buffer->file_num; f++){
+        PMEMoid oid = pmemobj_root(write_buffer->pool[f], sizeof(struct write_buffer_file_root));
+        struct write_buffer_file_root *root = pmemobj_direct(oid);
+        if(!root || root->segment_num > WSB_NUM_MAX) return 0;
+        for(unsigned s = 0; s < root->segment_num; s++){
+            size_t stride = root->segment_element_size[s];
+            const char *base = pmemobj_direct(root->segment[s]);
+            if(!base || stride < WBF_SLOT_MIN_SIZE || stride > LIBDB_WBF_MAX_RECORD_SIZE ||
+               (stride & (stride - 1))) return 0;
+            for(size_t off = 0; off + stride <= WSB_SIZE; off += stride){
+                uint16_t key_size;
+                memcpy(&key_size, base + off, sizeof(key_size));
+                if(!key_size) continue;
+                struct kv_record_view view;
+                if(kv_record_decode(base + off, stride, &view) || !view.value_size){
+                    fprintf(stderr, "WBF invalid slot: file=%u segment=%u offset=%zu stride=%zu key_size=%u\n",
+                            f, s, off, stride, (unsigned)key_size);
+                    return 0;
+                }
+                bytes += stride;
+            }
+        }
+    }
+    atomic_store_explicit(&write_buffer->used_slot_bytes, bytes, memory_order_relaxed);
+    return 1;
 }
 
 int write_buffer_segement_new(struct write_buffer * write_buffer , int size , struct write_buffer_free_node ** free_list_head){
@@ -110,12 +149,21 @@ int write_buffer_segement_new(struct write_buffer * write_buffer , int size , st
         q_size *= 2;
     }
     struct write_buffer_free_node * node = (struct write_buffer_free_node *)malloc(sizeof(struct write_buffer_free_node));
-    if(pmemobj_alloc(pool, &node->buffer , WSB_SIZE , 0 , 0 , 0)){
+    if(!node){ pthread_mutex_unlock(&g_mutex_lock_wbs); return 0; }
+    if(metadata->segment_num >= WSB_NUM_MAX ||
+       pmemobj_zalloc(pool, &node->buffer, WSB_SIZE, 0)){
         printf("write_buffer_file_%d no free space , consists of %d WBSs\n" , write_buffer->file_num-1 , ((struct write_buffer_file_root *)pmemobj_direct(pmemobj_root(pool , sizeof(struct write_buffer_file_root))))->segment_num);
         printf("create write_buffer_file_%d\n" , write_buffer->file_num);
+        if(write_buffer->file_num >= MAX_FILE_NUM){
+            free(node);
+            pthread_mutex_unlock(&g_mutex_lock_wbs);
+            return 0;
+        }
         write_buffer->pool[write_buffer->file_num] = write_buffer_file_new(write_buffer->file_num);
         if(write_buffer->pool[write_buffer->file_num] == NULL){
             printf("create write_buffer_file %d failed\n" , write_buffer->file_num);
+            free(node);
+            pthread_mutex_unlock(&g_mutex_lock_wbs);
             return 0;
         }
         write_buffer->file_num++;
@@ -125,28 +173,23 @@ int write_buffer_segement_new(struct write_buffer * write_buffer , int size , st
         return write_buffer_segement_new(write_buffer , size , free_list_head);
     }
 
-    //WBS创建成功
-    if(node->buffer.off % LNF_SLOT_MIN_SIZE != 0){
-        node->buffer.off = (node->buffer.off / LNF_SLOT_MIN_SIZE) * LNF_SLOT_MIN_SIZE;
-        node->num = WSB_SIZE / q_size - 1;
-    }
-    else{
-         node->num = WSB_SIZE / q_size;
-    }
+    /* Use the exact PMDK allocation. Rounding down can overwrite allocator
+     * metadata before the object. Zeroed unused slots are recovery-safe. */
+    node->num = WSB_SIZE / q_size;
     /*修改metadata*/
     metadata->segment_element_size[metadata->segment_num] = q_size;
     metadata->segment[metadata->segment_num] = node->buffer;
-    pmem_persist(&metadata->segment_element_size[metadata->segment_num] , sizeof(q_size));
+    pmem_persist(&metadata->segment_element_size[metadata->segment_num] , sizeof(metadata->segment_element_size[metadata->segment_num]));
     pmem_persist(&metadata->segment[metadata->segment_num] , sizeof(PMEMoid));
 
 
     metadata->segment_num ++;
     pmem_persist(&metadata->segment_num, sizeof(short));
+    node->WBF_seq = write_buffer->file_num - 1;
     pthread_mutex_unlock(&g_mutex_lock_wbs);
     /*修改free_node*/
     node->size = q_size;
     node->next = *free_list_head;
-    node->WBF_seq = write_buffer->file_num - 1;
     *free_list_head = node;
     return 1;
 }
@@ -180,6 +223,7 @@ struct write_buffer_free_node ** free_list_head , PMEMobjpool ** pool){
         return OID_NULL;
     }
     id = node->buffer;
+    atomic_fetch_add_explicit(&write_buffer->used_slot_bytes, node->size, memory_order_relaxed);
     node->num -- ;
     node->buffer.off += node->size;
     *pool = write_buffer->pool[node->WBF_seq];
@@ -237,9 +281,10 @@ PMEMoid write_buffer_insert(key_type key, kv_version_type version,
     return id;
 }
 
-int write_buffer_free(PMEMoid id , uint16_t WBF_seq , int size, struct write_buffer_free_node ** free_list_head){
+int write_buffer_free(struct write_buffer *write_buffer, PMEMoid id , uint16_t WBF_seq , int size, struct write_buffer_free_node ** free_list_head){
     int q_size = WBF_SLOT_MIN_SIZE;
-    if(OID_IS_NULL(id) || free_list_head == NULL){
+    if(!write_buffer || OID_IS_NULL(id) || free_list_head == NULL || size <= 0 ||
+       size > LIBDB_WBF_MAX_RECORD_SIZE){
         return 0;
     }
     while(q_size < size){
@@ -285,5 +330,13 @@ int write_buffer_free(PMEMoid id , uint16_t WBF_seq , int size, struct write_buf
     node->WBF_seq = WBF_seq;
     node->next = *free_list_head;
     *free_list_head = node;
+    uint64_t before = atomic_load_explicit(&write_buffer->used_slot_bytes, memory_order_relaxed);
+    do {
+        if(before < (uint64_t)q_size){
+            fprintf(stderr, "write-buffer occupancy underflow\n");
+            abort();
+        }
+    } while(!atomic_compare_exchange_weak_explicit(&write_buffer->used_slot_bytes,
+                &before, before - q_size, memory_order_relaxed, memory_order_relaxed));
     return 1;
 }

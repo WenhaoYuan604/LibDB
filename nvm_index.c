@@ -5,6 +5,8 @@
 #include "subspace.h"
 #include "write_buffer_index.h"
 #include <errno.h>
+#include "index.h"
+#include "merge_flush.h"
 #include <libpmemobj/base.h>
 
 /*
@@ -217,17 +219,17 @@ nvm_index_insert_after_flush_body(struct subspace_info *subspace_info, struct nv
                 slot_element_array[n].key = buffer_key[last_k];
                 slot_element_array[n].addr = buffered_addr[last_k];
                 subspace_info->key_num++;
-                g_map[buffered_addr[last_k].block]++;
+                block_ref_add(buffered_addr[last_k].block);
                 last_k++;
             }
             else{//插入已经存在的键值对
                 if(!is_initialize){
                     subspace_info->redundant_size += slot_element->addr.size;
-                    g_map[slot_element->addr.block]--;
+                    block_ref_remove(slot_element->addr.block);
                 }
                 slot_element_array[n].key = buffer_key[last_k];
                 slot_element_array[n].addr = buffered_addr[last_k];
-                g_map[buffered_addr[last_k].block]++;
+                block_ref_add(buffered_addr[last_k].block);
                 last_k ++;
                 slot_element ++;
                 j++;
@@ -408,6 +410,7 @@ struct slot_element * binarySearch(struct slot_element arr[], int left, int righ
 
 /*在nvm_index中检索*/
 struct address_type nvm_index_search(struct subspace_info * subspace_info , key_type key){
+    if(subspace_info == NULL || subspace_info->slot_num == 0) return ADDR_NULL;
     int i;
     for(i = 0 ; i < subspace_info->slot_num - 1 ; i++){
         if(key >= subspace_info->min_key[i+1] ){
@@ -431,57 +434,44 @@ struct address_type nvm_index_search(struct subspace_info * subspace_info , key_
 }
 
 
-void nvm_index_delete(struct subspace_info * subspace_info ,key_type key){
-    int i ;
-    int left , right;
-    for( i = 0 ; i < subspace_info->slot_num - 1 ; i++){
-        if(key >= subspace_info->min_key[i+1] ){
-            continue;
-        }
-        else{
-            break;
-        }
+bool nvm_index_delete(struct subspace_info *group, key_type key, struct thread *thread){
+    if(group->slot_num == 0) return false;
+    assert(!subspace_busy(group));
+    uint32_t i = 0;
+    while(i + 1 < group->slot_num && key >= group->min_key[i + 1]) i++;
+    struct nvm_index_slot image = *subspace_nvm_slot(group, i);
+    uint32_t j = 0, count = group->slot_key_num[i];
+    while(j < count && image.entries[j].key < key) j++;
+    if(j == count || image.entries[j].key != key) return false;
+    struct address_type old = image.entries[j].addr;
+    memmove(image.entries + j, image.entries + j + 1,
+            (count - j - 1) * sizeof(image.entries[0]));
+    memset(image.entries + count - 1, 0, sizeof(image.entries[0]));
+    if(count == 1) memset(&image, 0, sizeof(image));
+    if(nvm_index_commit_one_slot(group->pool[i], group->slot[i], &image) != 0){
+        fprintf(stderr, "delete: persistent slot update failed\n");
+        exit(EXIT_FAILURE);
     }
-    struct nvm_index_slot *persistent_slot =
-        (struct nvm_index_slot *)pmemobj_direct(subspace_info->slot[i]);
-    if(persistent_slot == NULL){
-        return;
+    group->key_num--;
+    if(count == 1){
+        nvm_index_recycle_slot(thread->index->nvm_index, &thread->index_free_head, group->slot[i]);
+        group->slot_num--;
+#define SHIFT_SLOT(field) memmove(group->field + i, group->field + i + 1, \
+        (group->slot_num - i) * sizeof(group->field[0])); \
+        memset(group->field + group->slot_num, 0, sizeof(group->field[0]))
+        SHIFT_SLOT(slot); SHIFT_SLOT(pool); SHIFT_SLOT(min_key);
+        SHIFT_SLOT(slot_key_num); SHIFT_SLOT(need_persist);
+#undef SHIFT_SLOT
+    }else{
+        group->slot_key_num[i]--;
+        group->min_key[i] = image.entries[0].key;
     }
-    struct slot_element *slot_element = persistent_slot->entries;
-    left = 0;
-    right = subspace_info->slot_key_num[i]-1;
-
-    while (left <= right) {
-        int mid = left + (right - left) / 2;
-
-        // 检查目标值是否在中间位置
-        if (slot_element[mid].key == key) {//找到目标
-            struct nvm_index_slot slot_image;
-            memcpy(&slot_image, persistent_slot, sizeof(slot_image));
-            struct slot_element *image_elements = slot_image.entries;
-            memmove(&image_elements[mid], &image_elements[mid + 1],
-                    sizeof(struct slot_element) *
-                        (subspace_info->slot_key_num[i] - mid - 1));
-            memset(&image_elements[subspace_info->slot_key_num[i] - 1], 0,
-                   sizeof(struct slot_element));
-            if(nvm_index_commit_one_slot(
-                   subspace_info->pool[i], subspace_info->slot[i],
-                   &slot_image) != 0){
-                fprintf(stderr, "leaf-slot delete transaction failed\n");
-                return;
-            }
-            subspace_info->min_key[i] = image_elements[0].key;
-            return ;
-        }
-
-        // 如果目标值大于中间值，忽略左半部分
-        if (slot_element[mid].key < key) {
-            left = mid + 1;
-        }
-        // 如果目标值小于中间值，忽略右半部分
-        else {
-            right = mid - 1;
-        }
+    group->redundant_size += old.size;
+    if(g_map[old.block]) block_ref_remove(old.block);
+    if(!g_map[old.block]){
+        reclaim_blocks(thread, &old.block, 1);
+        if(group->total_block_num) group->total_block_num--;
+        group->redundant_size = group->redundant_size > BLOCK_SIZE ? group->redundant_size - BLOCK_SIZE : 0;
     }
-    return ;
+    return true;
 }

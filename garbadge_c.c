@@ -1,4 +1,6 @@
+#include "space_stats.h"
 #include "./garbadge_c.h"
+#include "merge_flush.h"
 #include "kv_record.h"
 #include "dram_index.h"
 #include "nvm_index.h"
@@ -126,8 +128,8 @@ void garbadge_collection_cb_write_cb(void *arg, const struct spdk_nvme_cpl *comp
         free(task->gc_slot_updates);
         task->gc_slot_updates = NULL;
         task->gc_slot_update_count = 0;
-        free_block(task->block_array_to_gc, task->total_block_num_to_gc,
-                   &thread->curr_segment, thread->fs);
+        reclaim_blocks(thread, task->block_array_to_gc, task->total_block_num_to_gc);
+        maintenance_request_flush(thread, subspace_info->boundary);
         subspace_info->is_gc = 0;
         free(task->block_array_to_gc);
         subspace_info->total_block_num -=
@@ -199,7 +201,7 @@ int fill_buffer_and_update_index(char * buffer , struct subspace_info * subspace
                 slot_element->addr.off = off;
                 off += slot_element->addr.size;
                 slot_changed = 1;
-                g_map[new_block[block_curr]] ++;
+                block_ref_add(new_block[block_curr]);
             }
             slot_element ++;
         }
@@ -209,144 +211,10 @@ int fill_buffer_and_update_index(char * buffer , struct subspace_info * subspace
     }
     access_nvm_release();
 
-    if (block_curr > 0 &&
-        off > 0 &&
-        off < (int)(BLOCK_SIZE * 1)) {
-
-        int tail_start = block_curr * BLOCK_SIZE;
-        int tail_end   = tail_start + off;
-
-        // 检查是否可以与NVM缓存数据合并写入SSD
-
-        if (off + (int)subspace_info->buffered_size >= BLOCK_SIZE) {
-            // 优化路径：尾部数据 + NVM缓存数据 可以填充一个块
-            int needed_size = BLOCK_SIZE - off;
-            int extracted_size = 0;
-            int extracted_keys_count = 0;
-            key_type *extracted_keys = (key_type *)malloc(sizeof(key_type) * 100); // 预分配足够空间
-
-            // 从write_buffer_index中按键大小从小到大读取数据
-            extracted_size = extract_buffer_index_data(
-                buffer_to_store + tail_end,
-                subspace_info->buffer_index,
-                needed_size,
-                extracted_keys,
-                &extracted_keys_count
-            );
-
-            // 更新offset和块指针
-            int final_tail_size = off + extracted_size;
-
-            if (final_tail_size >= BLOCK_SIZE) {
-                // 合并后的数据可以填充一个块，直接写入SSD
-                if (new_block[block_curr] == 0)
-                    new_block[block_curr] = get_free_block(&thread->curr_segment , thread->fs);
-
-                // 删除已提取的write_buffer_index项并释放NVM空间
-                for (int i = 0; i < extracted_keys_count; i++) {
-                    write_buffer_index_delete(subspace_info->buffer_index, extracted_keys[i], false);
-                }
-
-                used_block = block_curr + 1;
-                g_map[new_block[block_curr]]++;
-
-                if (subspace_info->buffered_size > (uint32_t)extracted_size)
-                    subspace_info->buffered_size -= extracted_size;
-                else
-                    subspace_info->buffered_size = 0;
-            } else {
-                // 合并后的数据仍不足一个块，将合并数据写入NVM并释放申请的块
-                free_block(&new_block[block_curr], 1, &thread->curr_segment, thread->fs);
-
-                // 处理尾部数据（GC数据）
-                int pos = tail_start;
-                while (pos < tail_end) {
-                    struct kv_record_view view;
-                    if(kv_record_decode(buffer_to_store + pos,
-                                        (size_t)(tail_end - pos), &view) != 0){
-                        fprintf(stderr, "fatal: invalid KV record in GC tail\n");
-                        exit(EXIT_FAILURE);
-                    }
-                    key_type key = view.key;
-                    int entry_size = (int)view.record_size;
-
-                    uint16_t WBF_seq;
-                    struct write_buffer_return_type wb_ret;
-                    PMEMoid id = write_buffer_insert(
-                        view.key, view.version, view.value, view.value_size,
-                        thread->kvbuffer, &WBF_seq,
-                        &(thread->buffer_free_head), thread->thread);
-                    if (!OID_IS_NULL(id)) {
-                        hybrid_index_insert(thread->index, key, entry_size,
-                                            id, WBF_seq, &wb_ret, thread->thread);
-                        if (wb_ret.size != 0) {
-                            write_buffer_free(wb_ret.id, wb_ret.WBF_seq, wb_ret.size,
-                                              &(thread->buffer_free_head));
-                        }
-                    }
-
-                    pos += entry_size;
-                }
-
-                // 处理从buffer_index中提取的数据（也写入NVM）
-                pos = tail_end;
-                for (int i = 0; i < extracted_keys_count; i++) {
-                    // 已从buffer_index中读出的数据在buffer_to_store + tail_end位置
-                    // 这些数据已经在extract_buffer_index_data中复制到buffer中了
-                    // 但现在我们需要写入NVM而不是SSD，所以需要获取实际大小
-                    struct write_buffer_index_node *node = write_buffer_index_search(
-                        subspace_info->buffer_index, extracted_keys[i]
-                    );
-                    if (node != NULL) {
-                        // 数据已经在NVM中，只需删除索引
-                        write_buffer_index_delete(subspace_info->buffer_index, extracted_keys[i], false);
-                    }
-                }
-
-                used_block = block_curr;
-            }
-
-            free(extracted_keys);
-        } else {
-            // 原逻辑：尾部数据无法与NVM缓存合并，继续写入NVM
-            free_block(&new_block[block_curr], 1, &thread->curr_segment, thread->fs);
-
-            int pos = tail_start;
-            while (pos < tail_end) {
-                struct kv_record_view view;
-                if(kv_record_decode(buffer_to_store + pos,
-                                    (size_t)(tail_end - pos), &view) != 0){
-                    fprintf(stderr, "fatal: invalid KV record in GC tail\n");
-                    exit(EXIT_FAILURE);
-                }
-                key_type key = view.key;
-                int entry_size = (int)view.record_size;
-
-                uint16_t WBF_seq;
-                struct write_buffer_return_type wb_ret;
-                PMEMoid id = write_buffer_insert(
-                    view.key, view.version, view.value, view.value_size,
-                    thread->kvbuffer, &WBF_seq,
-                    &(thread->buffer_free_head), thread->thread);
-                if (!OID_IS_NULL(id)) {
-                    hybrid_index_insert(thread->index, key, entry_size,
-                                        id, WBF_seq, &wb_ret, thread->thread);
-                    if (wb_ret.size != 0) {
-                        write_buffer_free(wb_ret.id, wb_ret.WBF_seq, wb_ret.size,
-                                          &(thread->buffer_free_head));
-                    }
-                }
-
-                pos += entry_size;
-            }
-
-            // 尾块不再写回 SSD
-            used_block = block_curr;
-        }
-    } else {
-        used_block = block_curr + 1;
-    }
-
+    /* Keep the partial tail on SSD. Moving it into the active GWB here
+     * invalidates the staged slot addresses and may overwrite newer writes.
+     * Every staged address must name a destination that is actually written. */
+    used_block = block_curr + 1;
 
     memcpy(buffer , buffer_to_store , used_block * BLOCK_SIZE);
     free(buffer_to_store);
@@ -422,7 +290,7 @@ void garbadge_collection_cb(void *arg, const struct spdk_nvme_cpl *completnio){
 }
 
 
-uint32_t * block_redundant_compute(struct subspace_info * subspace_info , int * array_size ,struct thread * thread){
+static uint32_t * block_redundant_compute_fraction(struct subspace_info * subspace_info , int * array_size ,struct thread * thread, double fraction){
     struct redundant_element * redundant_array = (struct redundant_element *)malloc
     (sizeof(struct redundant_element) * subspace_info->total_block_num);
     memset(redundant_array , 0 , sizeof(struct redundant_element) * subspace_info->total_block_num);
@@ -451,7 +319,7 @@ uint32_t * block_redundant_compute(struct subspace_info * subspace_info , int * 
     uint32_t * arr = (uint32_t *)malloc(sizeof(uint32_t) * subspace_info->total_block_num);
     subspace_info->redundant_size = 0;
     for (int i = 0; i < subspace_info->total_block_num; i++) {
-        if(redundant_array[i].block_redundant_size >= BLOCK_SIZE * SUBSPACE_REDUNDANT_PERCENT_THRESHOLD){//被选中gc
+        if(redundant_array[i].block_redundant_size >= BLOCK_SIZE * fraction){//被选中gc
             arr[j] = redundant_array[i].block;
             j++;
         }
@@ -464,7 +332,14 @@ uint32_t * block_redundant_compute(struct subspace_info * subspace_info , int * 
     return arr;
 }
 /*垃圾回收*/
-void garbadge_collection(struct subspace_info * subspace_info ,struct thread * thread){
+uint32_t *block_redundant_compute(struct subspace_info *group, int *count, struct thread *thread) {
+    return block_redundant_compute_fraction(group, count, thread, space_stats_gc_fraction(thread->db));
+}
+void garbadge_collection(struct subspace_info *group, struct thread *thread) {
+    garbadge_collection_with_fraction(group, thread, space_stats_gc_fraction(thread->db));
+}
+void garbadge_collection_with_fraction(struct subspace_info * subspace_info ,struct thread * thread, double fraction){
+    if(subspace_info->is_merging || subspace_info->is_spliting || subspace_info->flush_block_num) return;
 
     struct ns_entry * ns_entry = (struct ns_entry * )thread->ns_entry;
     uint32_t * redundant_array;
@@ -474,7 +349,12 @@ void garbadge_collection(struct subspace_info * subspace_info ,struct thread * t
     int qpair_num = thread->thread % ctr_max_qp;
 
     /*计算每个块的冗余度*/
-    redundant_array = block_redundant_compute(subspace_info , &redundant_array_size , thread);
+    redundant_array = block_redundant_compute_fraction(subspace_info , &redundant_array_size , thread, fraction);
+    if(redundant_array_size == 0){
+        free(redundant_array);
+        subspace_info->is_gc = false;
+        return;
+    }
     task = get_free_task(ns_entry , thread->thread);
     while(task == NULL){//qpair已满
         if((qpair_excuting_once = spdk_nvme_qpair_process_completions(

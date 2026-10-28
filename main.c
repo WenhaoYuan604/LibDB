@@ -284,10 +284,10 @@ void parse_arg (int argc , char ** argv , struct db * db){
                 db->thread, db->size_kv, kvs , db->cachesize);
         fprintf(db->output_fp,
                 "LIBDB_FLUSH_BLOCK_COUNT=%d\nLIBDB_SUBSPACE_MAX_KEYS=%zu\n"
-                "LIBDB_SUBSPACE_MAX_SLOTS=%zu\nLIBDB_LNF_SLOT_ENTRY_CAPACITY=%zu\n"
+                "LIBDB_SUBSPACE_MERGE_LOWER_THRESHOLD=%zu\nLIBDB_SUBSPACE_MAX_SLOTS=%zu\nLIBDB_LNF_SLOT_ENTRY_CAPACITY=%zu\n"
                 "LIBDB_SUBSPACE_REDUNDANT_THRESHOLD=%f\nLIBDB_LNF_SLOT_SIZE=%u\n"
                 "LIBDB_LNF_POOL_SIZE_BYTES=%llu\nLIBDB_FREE_SPACE_GROUP_BLOCKS=%d\n",
-                Flush_Blcok_Num, (size_t)SUBSPACE_MAX_KEY, (size_t)SUBSPACE_MAX_SLOT,
+                Flush_Blcok_Num, (size_t)SUBSPACE_MAX_KEY, (size_t)LIBDB_SUBSPACE_MERGE_LOWER_THRESHOLD, (size_t)SUBSPACE_MAX_SLOT,
                 (size_t)LIBDB_LNF_SLOT_ENTRY_CAPACITY, SUBSPACE_REDUNDANT_PERCENT_THRESHOLD,
                 LNF_SLOT_MIN_SIZE, (unsigned long long)LNF_SIZE, alloc_grain);
     }
@@ -318,13 +318,17 @@ int main( int argc, char *argv[] ){
         return EXIT_FAILURE;
     }
     db_get_default(db);
+    atomic_init(&db->gc_space.relaxed, false);
+    space_stats_nvm_init(db);
     parse_arg(argc , argv , db);
+    space_stats_nvm_print(db, db->output_fp);
 
     thread = db->recovery_mode ? initialize_recovery(db) : initialize(db);
     if(thread == NULL){
         fprintf(stderr, "初始化失败（%s）\n", db->recovery_mode ? "recovery" : "正常路径");
         return EXIT_FAILURE;
     }
+    db->data_blocks = g_block_num;
     main_core = spdk_env_get_current_core();//main_core = 0;
     printf("main_core is %d\n" , main_core);
     fflush(stdout);
@@ -338,7 +342,7 @@ int main( int argc, char *argv[] ){
         thread[j].core = i;
         j++;
         printf("start server thread %d , core is %d\n" , j-1 , i);
-        if(spdk_env_thread_launch_pinned( i , (thread_start_fn)server_executor , &thread[j-1])){
+        if(spdk_env_thread_launch_pinned( i , server_executor , &thread[j-1])){
             printf("failed to start server thread\n");
 			return 0;
         }
@@ -352,5 +356,10 @@ int main( int argc, char *argv[] ){
 
     fflush(db->output_fp);
     benchmark_completed = 1;
+    spdk_env_thread_wait_all();
+    space_stats_nvm_print(db, stdout);
+    if(db->output_fp != stdout) space_stats_nvm_print(db, db->output_fp);
+    space_stats_print(db, stdout);
+    if(db->output_fp != stdout) space_stats_print(db, db->output_fp);
     return 0;
 }

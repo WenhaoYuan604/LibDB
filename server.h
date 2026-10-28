@@ -4,6 +4,6 @@
 #include "./base.h"
 #include "./get.h"
 
-void server_executor(void * arg);
+int server_executor(void * arg);
 
 #endif /* CC928376_609E_4FC6_874F_939DBDAA6D38 */

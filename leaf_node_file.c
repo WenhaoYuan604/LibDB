@@ -329,3 +329,18 @@ fail:
     free(nvm_index);
     return NULL;
 }
+
+/* The caller has already durably zeroed this slot. */
+void nvm_index_recycle_slot(struct nvm_index *index, struct nvm_index_free_node **head, PMEMoid slot){
+    PMEMobjpool *pool = pmemobj_pool_by_oid(slot);
+    uint32_t seq;
+    for(seq = 0; seq < index->file_num && index->pool[seq] != pool; seq++);
+    if(seq == index->file_num) abort();
+    struct nvm_index_free_node *node = malloc(sizeof(*node));
+    if(!node) return; /* durable empty slot will be recovered on restart */
+    node->num = 1;
+    node->LNF_seq = seq;
+    node->buffer = slot;
+    node->next = *head;
+    *head = node;
+}

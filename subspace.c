@@ -43,3 +43,34 @@ void subspace_info_output_detail( struct subspace_info * subspace_info ){
     }
     return ;
 }
+
+bool subspace_busy(const struct subspace_info *group){
+    return group->is_merging || group->is_spliting || group->is_gc || group->flush_block_num;
+}
+
+/* Count the union, not the sum: active GWB shadows frozen GWB and SSD. */
+uint32_t subspace_live_keys(struct subspace_info *group){
+    uint32_t count = group->key_num;
+    for(struct write_buffer_index *index = group->buffer_index; index; index = index->next){
+        for(struct write_buffer_index_node *node = index->head->forward[0]; node; node = node->forward[0]){
+            bool exists = !ADDR_IS_NULL(nvm_index_search(group, node->key));
+            for(struct write_buffer_index *newer = group->buffer_index;
+                !exists && newer != index; newer = newer->next)
+                exists = write_buffer_index_search(newer, node->key) != NULL;
+            if(!exists) count++;
+        }
+    }
+    return count;
+}
+
+void subspace_ref(struct subspace_info *group){ group->read_refs++; }
+
+void subspace_unref(struct subspace_info *group){
+    assert(group->read_refs);
+    group->read_refs--;
+    if(!group->read_refs && group->redirect){
+        struct subspace_info *successor = group->redirect;
+        free(group);
+        subspace_unref(successor);
+    }
+}

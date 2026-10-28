@@ -12,6 +12,7 @@ struct redundant_element{
 
 int block_exist(uint32_t block ,uint32_t * block_array ,int block_array_size_tmp);
 
+void garbadge_collection_with_fraction(struct subspace_info *, struct thread *, double fraction);
 void garbadge_collection(struct subspace_info * subspace_info ,struct thread * thread);
 
 /*

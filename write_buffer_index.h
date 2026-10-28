@@ -41,6 +41,9 @@ extern struct write_buffer_return_type RETURN_NULL ;
 
 void write_buffer_index_init(struct write_buffer_index *list);
 
+void write_buffer_index_merge(struct write_buffer_index *left, struct write_buffer_index *right);
+struct write_buffer_index *write_buffer_index_take_prefix(struct write_buffer_index *index, size_t max_keys, size_t max_bytes);
+
 void write_buffer_index_destroy(struct write_buffer_index *list);
 
 struct write_buffer_index_node* write_buffer_index_before(struct write_buffer_index *list, key_type key);

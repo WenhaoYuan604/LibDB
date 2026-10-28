@@ -112,6 +112,8 @@ struct subspace_info * dram_index_search(struct dram_index * hybrid_index , key_
     if(hybrid_index == NULL){
         printf("dram_index head is NULL\n");
     }
+    if(hybrid_index == NULL || hybrid_index->head == NULL ||
+       hybrid_index->head->nchild == 0) return NULL;
     struct dram_index_node * node = hybrid_index->head;
     while(1){
         key_type * pivot = upper_bound(node->key_child + 1, node->key_child + node->nchild, key) - 1;
@@ -140,4 +142,57 @@ struct dram_index * dram_index_initialize(key_type *subspace_array , int size){
         dram_index_insert( dram_index , subspace_array[i] , subspace , NULL);
     }
     return dram_index;
+}
+
+/* Traverse by parent links, including neighbors in another leaf. */
+struct subspace_info *dram_index_neighbor(struct dram_index *index, key_type key, int direction){
+    struct dram_index_node *node = NULL;
+    int pos;
+    if(!dram_index_search(index, key, &node, &pos)) return NULL;
+    for(;;){
+        int next = pos + direction;
+        if(next >= 0 && next < node->nchild){
+            if(node->is_leaf) return node->subspaces[next];
+            node = node->children[next];
+            while(!node->is_leaf)
+                node = node->children[direction > 0 ? 0 : node->nchild - 1];
+            return node->subspaces[direction > 0 ? 0 : node->nchild - 1];
+        }
+        struct dram_index_node *child = node;
+        node = node->parent;
+        if(!node) return NULL;
+        for(pos = 0; pos < node->nchild && node->children[pos] != child; pos++);
+    }
+}
+
+bool dram_index_remove(struct dram_index *index, key_type fence){
+    struct dram_index_node *node = NULL;
+    int pos;
+    if(!dram_index_search(index, fence, &node, &pos) || node->key_child[pos] != fence)
+        return false;
+    for(;;){
+        memmove(node->key_child + pos, node->key_child + pos + 1,
+                (node->nchild - pos - 1) * sizeof(node->key_child[0]));
+        memmove(node->children + pos, node->children + pos + 1,
+                (node->nchild - pos - 1) * sizeof(node->children[0]));
+        node->nchild--;
+        if(node->nchild || !node->parent) break;
+        struct dram_index_node *parent = node->parent;
+        for(pos = 0; parent->children[pos] != node; pos++);
+        free(node);
+        node = parent;
+    }
+    while(node->parent){
+        struct dram_index_node *parent = node->parent;
+        for(pos = 0; parent->children[pos] != node; pos++);
+        parent->key_child[pos] = node->key_child[0];
+        node = parent;
+    }
+    while(!index->head->is_leaf && index->head->nchild == 1){
+        node = index->head;
+        index->head = node->children[0];
+        index->head->parent = NULL;
+        free(node);
+    }
+    return true;
 }

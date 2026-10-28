@@ -171,7 +171,7 @@ static int recovery_wbf_install_latest(struct subspace_info *ss, key_type key,
     else{
         ss->buffered_size = 0;
     }
-    ss->buffered_size += (uint32_t)entry_size;
+    ss->buffered_size += (uint64_t)entry_size;
     return 1;
 }
 
@@ -1773,6 +1773,7 @@ int recovery_rebuild_index_and_write_buffer_parallel(struct db * db,
         return 0;
     }
     db->fs = new_fs;
+    block_ref_recount();
 
     uint64_t used_blocks = 0;
     uint64_t dup_refs = 0;
@@ -2181,6 +2182,7 @@ int recovery_rebuild_freespace_and_bitmap(struct db * db){
         return 0;
     }
     db->fs = new_fs;
+    block_ref_recount();
 
     uint64_t used_blocks = 0;
     uint64_t dup_refs = 0;

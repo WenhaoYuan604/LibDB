@@ -8,7 +8,15 @@
 
 #define ADDR_SET_NULL(o) ((o)->size = 0)
 
+struct pending_maintenance;
+struct block_pin;
+struct deferred_flush_queue;
 struct thread{
+    struct pending_maintenance *maintenance;
+    struct deferred_flush_queue *deferred_flush;
+    struct block_pin *read_pins;
+    bool servicing_maintenance;
+    uint64_t merge_count, merge_read_blocks, merge_write_blocks;
     struct db * db;
     struct lru_list * lru_list;
     uint64_t kv_version_next;

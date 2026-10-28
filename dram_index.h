@@ -24,6 +24,9 @@ void dram_index_insert(struct dram_index * dram_index , key_type key , struct su
 
 struct subspace_info * dram_index_search(struct dram_index * hybrid_index , key_type key, struct dram_index_node ** leaf_out , int * index_out);
 
+struct subspace_info *dram_index_neighbor(struct dram_index *index, key_type key, int direction);
+bool dram_index_remove(struct dram_index *index, key_type fence);
+
 struct dram_index * dram_index_initialize(key_type *subspace_array , int size);
 
 #endif

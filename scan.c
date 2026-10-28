@@ -120,13 +120,16 @@ void scan_cb(void * ctx, const struct spdk_nvme_cpl * cpl){
         }
         thread_scan_key[thread->thread] = scan_result->key[0];
 
-        int n = 0;
-        for(int i = 0 ; i < task->subspace_num ; i++){
-            kvcache_update_batch(subspace_info_array[i]->kvcache , thread->lru_list , &scan_result->key[n] ,
-            &scan_result->value[n] , &scan_result->value_size[n] , task->valid_key_per_subspace[i] , &task->kvcache_hit[n]
-            , &task->is_in_write_buffer[n] , thread->thread);
-            n += task->valid_key_per_subspace[i];
+        for(int i = 0; i < task->buffered_num; i++){
+            if(!task->kvcache_hit[i] && !task->is_in_write_buffer[i] &&
+               read_cache_mapping_current(thread, scan_result->key[i], addr[i])){
+                struct subspace_info *current = dram_index_search(thread->index->dram_index, scan_result->key[i], NULL, NULL);
+                kvcache_insert(current->kvcache, thread->lru_list, scan_result->key[i],
+                    scan_result->value[i], scan_result->value_size[i], thread->thread);
+            }
         }
+        read_unpin_blocks(thread, task->block_array, task->total_block_num);
+        for(int i = 0; i < task->subspace_num; i++) subspace_unref(subspace_info_array[i]);
         server_submit_result(task->key, (char *)scan_result , task->buffered_num , 2 , 0 ,
         thread->spdk_result_ring[task->key % thread->db->load_injectors] , task->start , NULL);
         free(task->block_array);
@@ -477,6 +480,8 @@ bool scan(key_type key1 , int length , char * value , struct thread * thread , u
         free(is_in_write_buffer);
         free(block);
         free(kvcache_hit);
+        free(subspace_info_array);
+        free(valid_key_per_subspace);
         server_submit_result(key1 , value , found_key , 2, 0 , thread->spdk_result_ring[key1 % thread->db->load_injectors]
          , start , NULL);
         return EXIT_SUCCESS;
@@ -554,11 +559,13 @@ bool scan(key_type key1 , int length , char * value , struct thread * thread , u
 
     int qpair_excuting_once , rc ;
     int qpair_num = thread->thread % ctr_max_qp;
+    for(int i = 0; i < valid_subspace; i++) subspace_ref(subspace_info_array[i]);
+    read_pin_blocks(thread, block, block_num);
     task = get_free_task(thread->ns_entry , thread->thread);
     while(task == NULL){//qpair已满
         if((qpair_excuting_once = spdk_nvme_qpair_process_completions(thread->ns_entry->qpair[qpair_num], 0)) < 0){
             printf("ERROR:fail to process_completions qpair[%d]\n" , qpair_num);
-            return 1;
+            exit(EXIT_FAILURE);
         }
         if(qpair_excuting_once != 0){
             task = get_free_task(thread->ns_entry , thread->thread);
@@ -588,8 +595,8 @@ bool scan(key_type key1 , int length , char * value , struct thread * thread , u
         rc = spdk_nvme_ns_cmd_read(thread->ns_entry->ns, thread->ns_entry->qpair[qpair_num], task->buffer + i * BLOCK_SIZE,
         block[i] * physical_block_to_logical_block , physical_block_to_logical_block, scan_cb , task , 0);
         if (rc != 0) {
-            printf("ERROR:starting read I/O failed\n");
-            return 1;
+            fprintf(stderr, "scan: read submission failed\n");
+            exit(EXIT_FAILURE);
         }
         else{
         }

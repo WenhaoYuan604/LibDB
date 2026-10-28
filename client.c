@@ -17,7 +17,7 @@ struct pending_scan_request pending_scans[MAX_PENDING_SCANS];
 int pending_scan_count = 0;      // 当前跟踪的scan请求数量
 pthread_mutex_t scan_mutex = PTHREAD_MUTEX_INITIALIZER;  // 保护访问scan数组的互斥锁
 int benchmark_start = 0;
-int test_completed ;
+_Atomic int test_completed;
 
 uint64_t ssd_block_space_consumed = 0;
 
@@ -150,19 +150,13 @@ void read_breakdown_output(struct db * db){
 
 void print_g_map_nonzero_count(void)
 {
-    size_t count = 0;
-    int block_num = g_block_num;
+    uint64_t count = atomic_load_explicit(&g_used_data_blocks, memory_order_relaxed);
 
     if (g_map == NULL) {
         printf("g_map is NULL, nothing to count\n");
         return;
     }
 
-    for (size_t i = 0; i < block_num; ++i) {
-        if (g_map[i] != 0) {
-            ++count;
-        }
-    }
     printf("Number of non-zero entries in g_map: %zu SSD spaces: %lu GB\n", count , count * BLOCK_SIZE / 1024 / 1024 /1024);
 }
 
@@ -173,6 +167,7 @@ void client_output_bw(struct db * db){
     uint64_t total_gc_write_block = 0;
     uint64_t total_split_block = 0;
     uint64_t total_split_block_write = 0;
+    uint64_t merges = 0, merge_reads = 0, merge_writes = 0;
     uint32_t total_subspace = 0;
     uint64_t total_subspace_dram_cost;
     uint64_t total_cache_hit = 0;
@@ -199,12 +194,17 @@ void client_output_bw(struct db * db){
         total_split_block_write += thread_split_block_write[i];
         total_flush_block += thread_flush_block_write[i];
         total_invalid_block += invalid_block_num[i];
+        merges += db->workers[i].merge_count;
+        merge_reads += db->workers[i].merge_read_blocks;
+        merge_writes += db->workers[i].merge_write_blocks;
+        db->workers[i].merge_count = 0;
+        db->workers[i].merge_read_blocks = db->workers[i].merge_write_blocks = 0;
     }
 
     print_g_map_nonzero_count();
 
     ssd_block_space_consumed += (total_flush_block + total_gc_write_block + total_split_block_write - (total_gc_block - total_gc_write_block) -
-     (total_split_block - total_split_block_write));
+     (total_split_block - total_split_block_write) + merge_writes - merge_reads);
 
     fprintf(db->output_fp ,"total bandwidth consumed : block %lu consume %luMB\n" , total_block ,  total_block * BLOCK_SIZE /  1024 / 1024);
 
@@ -215,6 +215,8 @@ void client_output_bw(struct db * db){
     fprintf(db->output_fp , "Split total consumed: block %lu consume %luMB\n" , total_split_block, total_split_block * BLOCK_SIZE / 1024 / 1024);
 
     fprintf(db->output_fp , "Split write consumed: block %lu consume %luMB\n" , total_split_block_write, total_split_block_write * BLOCK_SIZE / 1024 / 1024);
+
+    fprintf(db->output_fp, "Merge completed: %lu; read blocks: %lu; write blocks: %lu\n", merges, merge_reads, merge_writes);
 
     total_subspace_dram_cost = sizeof(struct subspace_info) * total_subspace;
     fprintf(db->output_fp ,"total : Subspaces %u  consume DRAM %luMB\n" ,  total_subspace , total_subspace_dram_cost /  1024 / 1024);
@@ -232,8 +234,8 @@ void client_output_bw(struct db * db){
     fprintf(db->output_fp , "scan : scan %lu keys on block %lu read %lu block\n", total_scan_key, total_scan_key_on_block
     , total_scan_block);
 
-    fprintf(db->output_fp , "WA is %lu / %lu = %f\n", (total_gc_write_block + total_split_block_write + total_flush_block) * BLOCK_SIZE / 1024 / 1024
-    , (uint64_t)50000000UL * 1024UL / 1024UL / 1024UL , (double)((total_gc_write_block + total_split_block_write + total_flush_block) * BLOCK_SIZE) / (uint64_t)50000000 * 1024);
+    fprintf(db->output_fp , "WA is %lu / %lu = %f\n", (total_gc_write_block + total_split_block_write + merge_writes + total_flush_block) * BLOCK_SIZE / 1024 / 1024
+    , (uint64_t)50000000UL * 1024UL / 1024UL / 1024UL , (double)((total_gc_write_block + total_split_block_write + merge_writes + total_flush_block) * BLOCK_SIZE) / (uint64_t)50000000 * 1024);
 
 
     memset(thread_scan_block , 0 , sizeof(uint64_t) * db->thread);
@@ -267,6 +269,11 @@ void load_injector_pooling_completion(struct result ** result , int result_num ,
     for(int i = 0 ; i < result_num ; i++){
         histogram_update(thread, result[i]->end - result[i]->start);
         if (result[i]->type == 0) {//read
+            if(result[i]->size == 0){ /* missing key, including completed deletes */
+                free(result[i]->value);
+                free(result[i]);
+                continue;
+            }
             client_key_to_value(result[i]->key , value , result[i]->size);
             if(strcmp(value , result[i]->value) != 0){
                 printf("result error:key %lu\nresult.value %s\n" , result[i]->key , result[i]->value);
@@ -305,11 +312,16 @@ void client_polling_completed(struct db * db , int polling_num){
     uint64_t completed;
 
     while (!test_completed) {
+        space_stats_gc_poll(db);
+        space_stats_nvm_poll(db);
         completed = 0;
         for(int i=0 ; i < db->load_injectors ; i++){
             completed += load_injector_completed[i];
         }
         if(completed >= polling_num){
+            /* End dynamic scheduling as soon as workload results arrive,
+             * before printing summaries or joining injector threads. */
+            space_stats_nvm_stop(db);
             test_completed = 1;
             break;
         }
@@ -403,12 +415,13 @@ void load_executor(void * arg){
         load_injector_completed[load_injector->thread] += result_num;
     }
 
-    pthread_barrier_wait(&barrier_complete);
     printf("load_injector[%d] completed %lu\n" ,load_injector->thread, load_injector_completed[load_injector->thread]);
     fflush(stdout);
+    pthread_barrier_wait(&barrier_complete);
 }
 
-void client_initialize_load_injectors(struct db * db , struct user_rq * load, int load_num){
+bool client_initialize_load_injectors(struct db * db , struct user_rq * load, int load_num){
+    if(!db || !load || load_num <= 0 || db->load_injectors <= 0) return false;
     uint64_t ticks = spdk_get_ticks_hz() ;
     uint64_t start ;
     uint64_t end ;
@@ -416,8 +429,9 @@ void client_initialize_load_injectors(struct db * db , struct user_rq * load, in
 
     struct load_injectors * load_injectors = (struct load_injectors *)malloc(sizeof(struct load_injectors) * db->load_injectors);
 
+    if(!load_injectors) return false;
     pthread_barrier_init(&barrier, NULL, db->load_injectors + 1);
-    pthread_barrier_init(&barrier_complete, NULL, db->load_injectors );
+    pthread_barrier_init(&barrier_complete, NULL, db->load_injectors + 1);
     test_completed = 0;
     for(int i = 0 ; i < db->load_injectors ; i++){
         load_injectors[i].db = db;
@@ -432,7 +446,7 @@ void client_initialize_load_injectors(struct db * db , struct user_rq * load, in
         fflush(stdout);
         if(spdk_env_thread_launch_pinned(load_injectors[i].core , (thread_start_fn)load_executor , &load_injectors[i])){
             printf("failed to start load thread %d\n" , i);
-			return;
+			return false;
         }
         else{
             printf("start load thread %d done\n" , i);
@@ -443,6 +457,9 @@ void client_initialize_load_injectors(struct db * db , struct user_rq * load, in
     pthread_barrier_wait(&barrier);
     start = spdk_get_ticks();
     client_polling_completed(db , load_num);
+    pthread_barrier_wait(&barrier_complete);
+    pthread_barrier_destroy(&barrier);
+    pthread_barrier_destroy(&barrier_complete);
     end = spdk_get_ticks();
     printf("load done\n");
     time = (double)(end - start) / ticks;
@@ -456,12 +473,16 @@ void client_initialize_load_injectors(struct db * db , struct user_rq * load, in
     histogram_compact(db->load_injectors);
     histogram_reset_all(db->load_injectors);
     fflush(db->output_fp);
-    memset(load_injector_completed , 0 , sizeof(uint64_t) * db->load_injectors);
+    memset(load_injector_completed, 0, sizeof(uint64_t) * db->load_injectors);
     free(load_injectors);
+    return true;
 }
 
 
+static struct db *client_monitor_db;
+
 void client_executor(struct db * db){
+    client_monitor_db = db;
 
 
     struct user_rq * warm = NULL;
@@ -487,6 +508,7 @@ void client_executor(struct db * db){
     if (warm == NULL || warm_num == 0) {
         fprintf(stderr, "failed to load warm workload: %s\n", g_libdb_config.warm_path);
         benchmark_completed = 1;
+        client_monitor_db = NULL;
         return;
     }
 
@@ -494,8 +516,15 @@ void client_executor(struct db * db){
     if (!db->recovery_mode) {
         printf("start to load\n");
         fflush(stdout);
-        client_initialize_load_injectors(db ,warm, warm_num);
-        sleep(10);
+        db->initial_load.complete = client_initialize_load_injectors(db ,warm, warm_num);
+        if(!db->initial_load.complete) {
+            fprintf(stderr, "initial load failed; stopping benchmark\n");
+            exit(EXIT_FAILURE);
+        }
+        if(db->initial_load.complete)
+            db->initial_load.error = space_stats_load_bytes(warm, warm_num, &db->initial_load.record_bytes);
+        space_stats_gc_poll(db);
+        space_stats_gc_wait(db, 10);
     } else {
         printf("recovery mode: skip load, keep cache warmup\n");
         fflush(stdout);
@@ -506,10 +535,11 @@ void client_executor(struct db * db){
         warm[i].type = 0;
     }
     if (cache_key_num > 0) {
-        client_initialize_load_injectors(db ,&warm[warm_num - cache_key_num], cache_key_num);
+        if(!client_initialize_load_injectors(db ,&warm[warm_num - cache_key_num], cache_key_num))
+            exit(EXIT_FAILURE);
     }
 
-    sleep(10);
+    space_stats_gc_wait(db, 10);
     test_get_num = 0;
     test_insert_num = 0;
     test_update_num = 0;
@@ -522,7 +552,10 @@ void client_executor(struct db * db){
     if (test == NULL || test_num == 0) {
         fprintf(stderr, "failed to load test workload: %s\n", g_libdb_config.test_path);
     } else {
-        client_initialize_load_injectors(db ,test, test_num);
+        space_stats_nvm_start(db);
+        if(!client_initialize_load_injectors(db ,test, test_num))
+            exit(EXIT_FAILURE);
+        space_stats_nvm_stop(db);
         free(test);
     }
     fflush(stdout);
@@ -531,7 +564,7 @@ void client_executor(struct db * db){
 
     benchmark_completed = 1;
 
-    EXIT_SUCCESS ;
+    client_monitor_db = NULL;
 }
 
 
@@ -556,6 +589,7 @@ struct user_rq * client_read_request(char * file  , int * num , int kvsize){
     }
 
     while(!feof(fp)){
+        if(client_monitor_db && (i % 1024 == 0)) space_stats_gc_poll(client_monitor_db);
 
         if (fscanf(fp , "%s user%lu " , s , &user) != 2) {
             break;
@@ -641,6 +675,7 @@ struct user_rq * client_read_production_request(char * file  , int * num){
     }
 
     while(!feof(fp)){
+        if(client_monitor_db && (i % 1024 == 0)) space_stats_gc_poll(client_monitor_db);
 
         if (fscanf(fp , "%s user%lu " , s , &user) != 2) {
             break;
