@@ -24,9 +24,9 @@ struct gc_space_control {
 enum nvm_flush_phase { NVM_FLUSH_FIXED, NVM_FLUSH_WORKLOAD, NVM_FLUSH_STOPPED };
 struct nvm_flush_control {
     atomic_int phase;
-    atomic_bool pressure; /* 0: defer, 1: flush eligible groups. */
     bool sampled;
     uint64_t last_sample_ns, sampled_bytes, peak_bytes, pressure_changes;
+    uint64_t pressure_peak_bytes;
 };
 void space_stats_nvm_init(struct db *);
 void space_stats_nvm_start_at(struct db *, uint64_t now_ns);

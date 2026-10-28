@@ -1,45 +1,91 @@
 #include "./kvbuffer.h"
 #include <libpmem.h>
 #include "kv_record.h"
+#include <dirent.h>
+#include <sys/stat.h>
+#include <inttypes.h>
+#include <errno.h>
 
 char * write_buffer_file_str(int file_seq){
     return libdb_config_make_pmem_path("write_buffer_file", (unsigned int)file_seq);
 }
 
-PMEMobjpool * write_buffer_file_new(int file_seq){
-    PMEMobjpool * pool;
-    uint64_t file_size = WBF_SIZE;
-    if(file_size < PMEMOBJ_MIN_POOL)
-        file_size = PMEMOBJ_MIN_POOL;
-    char * file_name = write_buffer_file_str(file_seq);
-    if(file_name == NULL){
-        fprintf(stderr, "failed to build write-buffer PMEM path\n");
+PMEMobjpool * write_buffer_file_new(struct write_buffer *wb){
+    uint64_t size = WBF_SIZE < PMEMOBJ_MIN_POOL ? PMEMOBJ_MIN_POOL : WBF_SIZE;
+    if(wb->file_bytes > LIBDB_WBF_CAPACITY_LIMIT_BYTES ||
+       size > LIBDB_WBF_CAPACITY_LIMIT_BYTES - wb->file_bytes){
+        wb->limit_rejections++;
+        fprintf(stderr, "WBF hard limit: file_bytes=%" PRIu64 " requested_bytes=%" PRIu64
+                " hard_limit_bytes=%" PRIu64 " limit_rejections=%" PRIu64 "\n",
+                wb->file_bytes, size, (uint64_t)LIBDB_WBF_CAPACITY_LIMIT_BYTES, wb->limit_rejections);
         return NULL;
     }
-
-    pool = pmemobj_create(file_name , "write_buffer" , file_size , 0666);
-    if(pool == NULL){
-        printf("%s pmemobj_create failed\n" , file_name);
-        free(file_name);
+    if(wb->file_num >= MAX_FILE_NUM) return NULL;
+    char *path = write_buffer_file_str(wb->file_num);
+    if(!path) return NULL;
+    PMEMobjpool *pool = pmemobj_create(path, "write_buffer", size, 0666);
+    if(!pool){
+        fprintf(stderr, "%s pmemobj_create failed: %s\n", path, pmemobj_errormsg());
+        free(path);
         return NULL;
     }
-    else{
-        printf("%s pmemobj_create done\n" , file_name);
-    }
-    free(file_name);
-
-     /*root*/
-    PMEMoid root;
-    struct write_buffer_file_root * metadata;
-    root = pmemobj_root(pool , sizeof(struct write_buffer_file_root));
+    /* Account the file immediately, even if root initialization fails. */
+    wb->file_bytes += size;
+    if(wb->file_bytes > wb->file_peak_bytes) wb->file_peak_bytes = wb->file_bytes;
+    write_buffer_raise_pressure_locked(wb);
+    PMEMoid root = pmemobj_root(pool, sizeof(struct write_buffer_file_root));
     if(OID_IS_NULL(root)){
-        printf("Couldn't access root obj\n");
-        return 0;
+        fprintf(stderr, "WBF root initialization failed: %s\n", path);
+        pmemobj_close(pool);
+        free(path);
+        /* The newly created file is retained and charged; do not retry over it. */
+        exit(EXIT_FAILURE);
     }
-    metadata = (struct write_buffer_file_root *)pmemobj_direct(root);
+    struct write_buffer_file_root *metadata = pmemobj_direct(root);
     metadata->segment_num = 0;
-    pmemobj_persist(pool , metadata , sizeof(metadata));
+    pmemobj_persist(pool, metadata, sizeof(*metadata));
+    wb->pool[wb->file_num++] = pool;
+    printf("%s pmemobj_create done\n", path);
+    free(path);
     return pool;
+}
+
+/* Inspect every WBF-prefixed entry before opening any pool. Never ignore a
+ * trailing file after a gap/open failure, or mutate an over-budget database. */
+static int write_buffer_inventory(uint64_t *bytes, uint32_t *count){
+    *bytes = 0; *count = 0;
+    DIR *dir = opendir(g_libdb_config.pmem_dir);
+    if(!dir) return 0;
+    struct dirent *entry;
+    bool seen[MAX_FILE_NUM] = {0};
+    int ok = 1;
+    while((entry = readdir(dir))){
+        const char *prefix = "write_buffer_file";
+        size_t len = strlen(prefix);
+        if(strncmp(entry->d_name, prefix, len)) continue;
+        const char *suffix = entry->d_name + len;
+        char *end;
+        errno = 0;
+        unsigned long seq = strtoul(suffix, &end, 10);
+        if(!*suffix || *suffix < '0' || *suffix > '9' || *end || errno || seq >= MAX_FILE_NUM || seen[seq]){
+            fprintf(stderr, "WBF invalid filename: %s\n", entry->d_name); ok = 0; break;
+        }
+        struct stat st;
+        if(fstatat(dirfd(dir), entry->d_name, &st, 0) || !S_ISREG(st.st_mode) || st.st_size < 0){
+            fprintf(stderr, "WBF cannot inspect file: %s\n", entry->d_name); ok = 0; break;
+        }
+        if((uint64_t)st.st_size > LIBDB_WBF_CAPACITY_LIMIT_BYTES - *bytes){
+            fprintf(stderr, "WBF recovery hard limit exceeded: file=%s hard_limit_bytes=%" PRIu64 "\n",
+                    entry->d_name, (uint64_t)LIBDB_WBF_CAPACITY_LIMIT_BYTES); ok = 0; break;
+        }
+        *bytes += (uint64_t)st.st_size;
+        seen[seq] = true;
+        (*count)++;
+    }
+    closedir(dir);
+    for(uint32_t i = 0; ok && i < *count; i++)
+        if(!seen[i]) { fprintf(stderr, "WBF file sequence contains a gap\n"); ok = 0; }
+    return ok;
 }
 
 static PMEMobjpool * write_buffer_file_open(int file_seq){
@@ -52,59 +98,57 @@ static PMEMobjpool * write_buffer_file_open(int file_seq){
     return pool;
 }
 
-struct write_buffer * write_buffer_initialize(){
-    struct write_buffer * write_buffer = (struct write_buffer *)malloc(sizeof(struct write_buffer));
-    if(!write_buffer) return NULL;
-    atomic_init(&write_buffer->used_slot_bytes, 0);
-    write_buffer->file_num = 0;
+static struct write_buffer *write_buffer_control_new(void){
+    struct write_buffer *wb = calloc(1, sizeof(*wb));
+    if(!wb) return NULL;
+    atomic_init(&wb->used_slot_bytes, 0);
+    atomic_init(&wb->reusable_slot_bytes, 0);
+    atomic_init(&wb->pressure, false);
+    if(pthread_mutex_init(&g_mutex_lock_wbs, NULL)) { free(wb); return NULL; }
+    return wb;
+}
 
-    write_buffer->pool[0] = write_buffer_file_new(0);
-    if(write_buffer->pool[0] == NULL){
-        printf("create write_buffer_file failed\n");
+struct write_buffer * write_buffer_initialize(){
+    uint64_t bytes;
+    uint32_t count;
+    if(!write_buffer_inventory(&bytes, &count) || count){
+        fprintf(stderr, "WBF fresh initialization requires an empty WBF file set\n");
         return NULL;
     }
-    write_buffer->file_num ++;
-
-    if(pthread_mutex_init(&g_mutex_lock_wbs , NULL) != 0){
-		printf("ERROR:fail to init g_mutex_lock_wbs\n");
-		return 0;
-	}
-
-    // write_buffer->free_list_head = NULL;
-
-    return write_buffer;
+    struct write_buffer *wb = write_buffer_control_new();
+    if(!wb) return NULL;
+    pthread_mutex_lock(&g_mutex_lock_wbs);
+    PMEMobjpool *pool = write_buffer_file_new(wb);
+    pthread_mutex_unlock(&g_mutex_lock_wbs);
+    if(!pool){ pthread_mutex_destroy(&g_mutex_lock_wbs); free(wb); return NULL; }
+    return wb;
 }
 
 struct write_buffer * write_buffer_open_existing(){
-    struct write_buffer * write_buffer = (struct write_buffer *)malloc(sizeof(struct write_buffer));
-    if(write_buffer == NULL){
-        return NULL;
+    uint64_t bytes;
+    uint32_t count;
+    if(!write_buffer_inventory(&bytes, &count) || !count) return NULL;
+    struct write_buffer *wb = write_buffer_control_new();
+    if(!wb) return NULL;
+    wb->file_bytes = wb->file_peak_bytes = bytes;
+    for(uint32_t i = 0; i < count; i++){
+        PMEMobjpool *pool = write_buffer_file_open(i);
+        if(!pool) goto fail;
+        wb->pool[wb->file_num++] = pool;
     }
-    atomic_init(&write_buffer->used_slot_bytes, 0);
-    write_buffer->file_num = 0;
-    for(uint32_t i = 0 ; i < MAX_FILE_NUM ; i++){
-        PMEMobjpool * pool = write_buffer_file_open(i);
-        if(pool == NULL){
-            break;
-        }
-        write_buffer->pool[write_buffer->file_num++] = pool;
-    }
-    if(write_buffer->file_num == 0){
-        free(write_buffer);
-        return NULL;
-    }
-    if(!write_buffer_rebuild_occupancy(write_buffer)){
-        fprintf(stderr, "recovery: invalid write-buffer occupancy metadata\n");
-        for(uint32_t i = 0; i < write_buffer->file_num; i++) pmemobj_close(write_buffer->pool[i]);
-        free(write_buffer);
-        return NULL;
-    }
-    if(pthread_mutex_init(&g_mutex_lock_wbs , NULL) != 0){
-        printf("ERROR:fail to init g_mutex_lock_wbs\n");
-        free(write_buffer);
-        return NULL;
-    }
-    return write_buffer;
+    if(!write_buffer_rebuild_occupancy(wb)) goto fail;
+    /* Recovery does not rebuild the WBF free lists. Invalid/unallocated slots
+     * therefore do not count as immediately reusable capacity. */
+    pthread_mutex_lock(&g_mutex_lock_wbs);
+    write_buffer_raise_pressure_locked(wb);
+    pthread_mutex_unlock(&g_mutex_lock_wbs);
+    return wb;
+fail:
+    fprintf(stderr, "recovery: cannot open or account WBF files\n");
+    for(uint32_t i = 0; i < wb->file_num; i++) pmemobj_close(wb->pool[i]);
+    pthread_mutex_destroy(&g_mutex_lock_wbs);
+    free(wb);
+    return NULL;
 }
 
 int write_buffer_rebuild_occupancy(struct write_buffer *write_buffer){
@@ -153,24 +197,14 @@ int write_buffer_segement_new(struct write_buffer * write_buffer , int size , st
     if(metadata->segment_num >= WSB_NUM_MAX ||
        pmemobj_zalloc(pool, &node->buffer, WSB_SIZE, 0)){
         printf("write_buffer_file_%d no free space , consists of %d WBSs\n" , write_buffer->file_num-1 , ((struct write_buffer_file_root *)pmemobj_direct(pmemobj_root(pool , sizeof(struct write_buffer_file_root))))->segment_num);
-        printf("create write_buffer_file_%d\n" , write_buffer->file_num);
-        if(write_buffer->file_num >= MAX_FILE_NUM){
+        if(!write_buffer_file_new(write_buffer)){
             free(node);
             pthread_mutex_unlock(&g_mutex_lock_wbs);
             return 0;
         }
-        write_buffer->pool[write_buffer->file_num] = write_buffer_file_new(write_buffer->file_num);
-        if(write_buffer->pool[write_buffer->file_num] == NULL){
-            printf("create write_buffer_file %d failed\n" , write_buffer->file_num);
-            free(node);
-            pthread_mutex_unlock(&g_mutex_lock_wbs);
-            return 0;
-        }
-        write_buffer->file_num++;
-        printf("create write_buffer_file_%d success , write_buffer->file_num is %d\n" , write_buffer->file_num-1 , write_buffer->file_num);
         free(node);
         pthread_mutex_unlock(&g_mutex_lock_wbs);
-        return write_buffer_segement_new(write_buffer , size , free_list_head);
+        return write_buffer_segement_new(write_buffer, size, free_list_head);
     }
 
     /* Use the exact PMDK allocation. Rounding down can overwrite allocator
@@ -186,11 +220,14 @@ int write_buffer_segement_new(struct write_buffer * write_buffer , int size , st
     metadata->segment_num ++;
     pmem_persist(&metadata->segment_num, sizeof(short));
     node->WBF_seq = write_buffer->file_num - 1;
-    pthread_mutex_unlock(&g_mutex_lock_wbs);
-    /*修改free_node*/
+    /* Publish free slots before releasing the geometry lock. */
     node->size = q_size;
     node->next = *free_list_head;
     *free_list_head = node;
+    atomic_fetch_add_explicit(&write_buffer->reusable_slot_bytes,
+                             (uint64_t)node->num * node->size, memory_order_relaxed);
+    write_buffer_raise_pressure_locked(write_buffer);
+    pthread_mutex_unlock(&g_mutex_lock_wbs);
     return 1;
 }
 
@@ -223,6 +260,8 @@ struct write_buffer_free_node ** free_list_head , PMEMobjpool ** pool){
         return OID_NULL;
     }
     id = node->buffer;
+    uint64_t free_before = atomic_fetch_sub_explicit(&write_buffer->reusable_slot_bytes, node->size, memory_order_relaxed);
+    if(free_before < node->size) abort();
     atomic_fetch_add_explicit(&write_buffer->used_slot_bytes, node->size, memory_order_relaxed);
     node->num -- ;
     node->buffer.off += node->size;
@@ -338,5 +377,6 @@ int write_buffer_free(struct write_buffer *write_buffer, PMEMoid id , uint16_t W
         }
     } while(!atomic_compare_exchange_weak_explicit(&write_buffer->used_slot_bytes,
                 &before, before - q_size, memory_order_relaxed, memory_order_relaxed));
+    atomic_fetch_add_explicit(&write_buffer->reusable_slot_bytes, q_size, memory_order_relaxed);
     return 1;
 }

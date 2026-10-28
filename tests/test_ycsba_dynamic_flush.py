@@ -34,6 +34,9 @@ mode = os.environ.get('MOCK_MODE', '')
 if mode == 'sleep': time.sleep(30)
 if mode == 'gate' and not enabled:
     while not Path(os.environ['RELEASE']).exists(): time.sleep(.02)
+if mode == 'cap_fail':
+    print('WBF hard limit: file_bytes=17179869184 requested_bytes=1073741824 hard_limit_bytes=17179869184 limit_rejections=1', file=sys.stderr, flush=True)
+    sys.exit(1)
 if mode == 'fail': sys.exit(7)
 if mode == 'incomplete': sys.exit(0)
 rate = 200 if enabled else 100
@@ -108,7 +111,7 @@ class DynamicFlushRunnerTest(unittest.TestCase):
             WORKLOAD_ROOT=str(self.uniform.parent), PCI_ADDR='0000:00:01.0',
             USE_SUDO='0', SKIP_DRIVER_CHECK='1', LIBDB_ALLOW_DESTRUCTIVE='1',
             AUDIT=str(self.audit), MOCK_DATABASE_TEMPLATE=str(template),
-            TIMEOUT_SECONDS='0', KILL_AFTER_SECONDS='1', BUILD_JOBS='6',
+            TIMEOUT_SECONDS='0', KILL_AFTER_SECONDS='1', BUILD_JOBS='6', LIBDB_DYNAMIC_FLUSH_MODES='off,on',
             THREADS='16', LOAD_INJECTORS='8', KV_SIZE='1024', KV_COUNT='100000000',
             CACHE_SIZE_MB='20000', TASKS_PER_THREAD='16', BOUNDARY_SIZE='1000')
 
@@ -197,6 +200,29 @@ class DynamicFlushRunnerTest(unittest.TestCase):
         finally:
             if proc.poll() is None: proc.terminate(); proc.communicate(timeout=5)
             proc.stdout.close()
+
+    def test_source_default_is_off_then_on(self):
+        env = dict(self.env)
+        env.pop('LIBDB_DYNAMIC_FLUSH_MODES')
+        result = subprocess.run([str(SCRIPT)], env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row['mode'] for row in self.rows()], ['off', 'on'])
+        self.clean()
+
+    def test_single_on_mode(self):
+        result = self.run_script(LIBDB_DYNAMIC_FLUSH_MODES='on')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row['mode'] for row in self.rows()], ['on'])
+        self.assertIn('single mode', (self.folder() / 'comparison.txt').read_text())
+        self.clean()
+
+    def test_capacity_rejection_is_reported_even_without_final_stats(self):
+        result = self.run_script(MOCK_MODE='cap_fail')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.rows()[0]['status'], 'capacity_limit')
+        self.assertEqual(self.rows()[0]['wbf_limit_rejections'], '1')
+        self.assertEqual(self.rows()[0]['wbf_capacity_limit_hit'], '1')
+        self.clean()
 
     def test_build_failure_prevents_all_database_runs(self):
         result = self.run_script(MOCK_BUILD_FAIL='build_on')
@@ -300,8 +326,65 @@ class DynamicFlushRunnerTest(unittest.TestCase):
     def test_help_does_not_require_devices_or_inputs(self):
         result = subprocess.run([str(SCRIPT), '--help'], capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0)
-        self.assertIn('OFF once, then ON once', result.stdout)
+        self.assertIn('source MODES setting (OFF then ON)', result.stdout)
         self.assertFalse(self.result.exists())
+
+
+class CapacityMetricsTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.log = Path(self.temp.name) / 'run.log'
+        self.result = Path(self.temp.name) / 'result.txt'
+        self.header = ('NVM flush: enabled=1 limit_bytes=16106127360 poll_ns=100000000 '
+            'occupancy=file_budget_minus_reusable phase=workload_only soft_limit=0 '
+            'low_bytes=15032385536 hard_limit_bytes=17179869184\n')
+        self.stat = ('nvm_used_slot_bytes=1234 nvm_sampled_peak_bytes=5678 '
+            'nvm_pressure_changes=2 nvm_sampled=1\n')
+        self.budget = ('wbf_file_count=16 wbf_file_bytes=17179869184 wbf_file_peak_bytes=17179869184 '
+            'wbf_reusable_slot_bytes=2147483648 nvm_pressure_bytes=15032385536 '
+            'nvm_pressure_sampled_peak_bytes=16106127360 wbf_limit_rejections=0\n')
+
+    def parse(self, budget=None, header=None):
+        text = (self.header if header is None else header) + self.stat + (self.budget if budget is None else budget)
+        self.log.write_text(text); self.result.write_text(text)
+        return runner.nvm_metrics(self.log, self.result, 1)
+
+    def test_new_metrics(self):
+        metrics = self.parse()
+        self.assertEqual(metrics['nvm_low_bytes'], 14 * 1024**3)
+        self.assertEqual(metrics['nvm_limit_bytes'], 15 * 1024**3)
+        self.assertEqual(metrics['nvm_hard_limit_bytes'], 16 * 1024**3)
+        self.assertEqual(metrics['wbf_capacity_verified'], 1)
+        self.assertEqual(metrics['wbf_capacity_limit_hit'], 0)
+        self.assertEqual(metrics['nvm_sampled_peak_bytes'], 5678)
+        self.assertEqual(metrics['nvm_pressure_sampled_peak_bytes'], 15 * 1024**3)
+
+    def test_legacy_is_not_hard_cap_verified(self):
+        metrics = self.parse('', 'NVM flush: enabled=1 limit_bytes=17179869184 poll_ns=100000000 '
+            'occupancy=unreclaimed_slots phase=workload_only soft_limit=1\n')
+        self.assertEqual(metrics['wbf_capacity_verified'], 0)
+        self.assertIsNone(metrics['nvm_hard_limit_bytes'])
+
+    def test_new_format_requires_capacity(self):
+        with self.assertRaisesRegex(ValueError, 'missing WBF'): self.parse('')
+
+    def test_rejects_excess_capacity_or_inconsistent_pressure(self):
+        with self.assertRaisesRegex(ValueError, 'exceeded WBF'):
+            self.parse(self.budget.replace('wbf_file_peak_bytes=17179869184', 'wbf_file_peak_bytes=20401094656'))
+        with self.assertRaisesRegex(ValueError, 'invalid or exceeded'):
+            self.parse(self.budget.replace('nvm_pressure_bytes=15032385536', 'nvm_pressure_bytes=1'))
+
+    def test_limit_rejections_are_visible(self):
+        metrics = self.parse(self.budget.replace('wbf_limit_rejections=0', 'wbf_limit_rejections=3'))
+        self.assertEqual(metrics['wbf_capacity_limit_hit'], 1)
+        self.assertEqual(metrics['wbf_limit_rejections'], 3)
+
+    def test_streams_must_match(self):
+        self.parse()
+        self.result.write_text(self.result.read_text().replace('nvm_pressure_changes=2', 'nvm_pressure_changes=3'))
+        with self.assertRaisesRegex(ValueError, 'disagree'):
+            runner.nvm_metrics(self.log, self.result, 1)
 
 
 if __name__ == '__main__':

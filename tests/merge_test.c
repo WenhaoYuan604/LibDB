@@ -155,6 +155,7 @@ int write_buffer_free(struct write_buffer *buffer, PMEMoid id, uint16_t seq, int
     CHECK(*key_size == sizeof(key_type));
     CHECK(atomic_load(&buffer->used_slot_bytes) >= slot_bytes(size));
     atomic_fetch_sub(&buffer->used_slot_bytes, slot_bytes(size));
+    atomic_fetch_add(&buffer->reusable_slot_bytes, slot_bytes(size));
     *key_size = 0;
     pmemobj_persist(pool, key_size, sizeof(*key_size));
     return 1;
@@ -168,6 +169,7 @@ PMEMoid write_buffer_insert(key_type key, kv_version_type version, const char *v
     CHECK(kv_record_encode(pmemobj_direct(oid), kv_record_size(value_size), key, version, value, value_size) == 0);
     pmemobj_persist(pool, pmemobj_direct(oid), kv_record_size(value_size));
     atomic_fetch_add(&buffer->used_slot_bytes, slot_bytes(kv_record_size(value_size)));
+    atomic_fetch_sub(&buffer->reusable_slot_bytes, slot_bytes(kv_record_size(value_size)));
     *seq = 0;
     return oid;
 }
@@ -187,6 +189,9 @@ static void setup(const char *path){
     persistent.pool[0] = pool;
     database.write_buffer = worker.kvbuffer = &test_wbf;
     atomic_init(&test_wbf.used_slot_bytes, 0);
+    test_wbf.file_bytes = test_wbf.file_peak_bytes = 32 * 1024 * 1024;
+    atomic_init(&test_wbf.reusable_slot_bytes, test_wbf.file_bytes);
+    CHECK(pthread_mutex_init(&g_mutex_lock_wbs, NULL) == 0);
     space_stats_nvm_init(&database);
     database.thread = 1;
     database.boundary_size = 2;
@@ -247,6 +252,7 @@ static void buffer_put(struct subspace_info *g, key_type key, char byte, size_t 
     CHECK(kv_record_encode(pmemobj_direct(oid), size, key, key + byte, value, size - KV_RECORD_HEADER_SIZE) == 0);
     pmemobj_persist(pool, pmemobj_direct(oid), size);
     atomic_fetch_add(&test_wbf.used_slot_bytes, slot_bytes(size));
+    atomic_fetch_sub(&test_wbf.reusable_slot_bytes, slot_bytes(size));
     struct write_buffer_return_type old = nvm_index_insert(g, oid, key, size, 0, 0);
     if(old.size) write_buffer_free(worker.kvbuffer, old.id, 0, old.size, NULL);
 }
@@ -677,7 +683,7 @@ static void dynamic_cycle_test(void){
     for(int i = 0; i < 16; i++) buffer_put(b, i + 1001, 'b', 1024);
     CHECK(subspace_maybe_flush(b, &worker)); /* exactly 16KiB stays buffered */
     uint64_t before = atomic_load(&test_wbf.used_slot_bytes);
-    CHECK(before == LIBDB_NVM_FLUSH_LIMIT_BYTES && !queued_count);
+    CHECK(before == LIBDB_NVM_FLUSH_HIGH_BYTES && !queued_count);
     void *queue = worker.deferred_flush;
     for(int i = 0; i < 100; i++) { CHECK(subspace_maybe_flush(a, &worker)); maintenance_poll(&worker); }
     CHECK(queue == worker.deferred_flush && !queued_count && !worker.maintenance);
@@ -693,6 +699,7 @@ static void dynamic_cycle_test(void){
     CHECK(b->buffered_size == 16 * 1024 && !worker.maintenance);
     check_get(1, 'a'); check_get(1001, 'b');
     space_stats_nvm_start_at(&database, 2 * LIBDB_NVM_FLUSH_POLL_NS);
+    uint64_t changes_at_start = database.nvm_flush.pressure_changes;
     CHECK(!space_stats_nvm_flush_allowed(&database));
     for(int i = 0; i < 48; i++) buffer_put(a, i + 1, 'c', 1024);
     CHECK(subspace_maybe_flush(a, &worker) && !queued_count);
@@ -700,7 +707,7 @@ static void dynamic_cycle_test(void){
     maintenance_poll(&worker); CHECK(queued_count); drain();
     space_stats_nvm_poll_at(&database, 4 * LIBDB_NVM_FLUSH_POLL_NS);
     CHECK(!space_stats_nvm_flush_allowed(&database));
-    CHECK(database.nvm_flush.pressure_changes == 2);
+    CHECK(database.nvm_flush.pressure_changes == changes_at_start + 2);
     check_get(1, 'c');
     maintenance_clear_deferred(&worker);
 }

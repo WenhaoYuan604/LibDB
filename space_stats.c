@@ -128,38 +128,50 @@ void space_stats_gc_wait(struct db *db, unsigned seconds) {
 /* Phase and pressure are the only fields read by workers. Main owns sampling. */
 void space_stats_nvm_init(struct db *db) {
     atomic_init(&db->nvm_flush.phase, NVM_FLUSH_FIXED);
-    atomic_init(&db->nvm_flush.pressure, false);
 }
 
 bool space_stats_nvm_flush_allowed(const struct db *db) {
     if(!LIBDB_DYNAMIC_FLUSH_ENABLED || !db) return true;
     int phase = atomic_load_explicit(&db->nvm_flush.phase, memory_order_acquire);
     return phase == NVM_FLUSH_FIXED || (phase == NVM_FLUSH_WORKLOAD &&
-        atomic_load_explicit(&db->nvm_flush.pressure, memory_order_relaxed));
+        (!db->write_buffer || atomic_load_explicit(&db->write_buffer->pressure, memory_order_relaxed)));
 }
 
-static void nvm_sample(struct db *db, uint64_t now_ns) {
+static void nvm_sample_locked(struct db *db, uint64_t now_ns) {
     struct nvm_flush_control *c = &db->nvm_flush;
-    /* Missing accounting must never silently enable unbounded deferral. */
-    uint64_t bytes = db->write_buffer ?
-        atomic_load_explicit(&db->write_buffer->used_slot_bytes, memory_order_relaxed) : UINT64_MAX;
-    bool pressure = bytes >= LIBDB_NVM_FLUSH_LIMIT_BYTES;
-    if(pressure != atomic_load_explicit(&c->pressure, memory_order_relaxed)) c->pressure_changes++;
-    atomic_store_explicit(&c->pressure, pressure, memory_order_relaxed);
+    struct write_buffer *wb = db->write_buffer;
+    uint64_t bytes = wb ? atomic_load_explicit(&wb->used_slot_bytes, memory_order_relaxed) : 0;
+    uint64_t pressure_bytes = wb ? write_buffer_pressure_bytes_locked(wb) : 0;
+    if(wb){
+        if(pressure_bytes >= LIBDB_NVM_FLUSH_HIGH_BYTES) write_buffer_set_pressure_locked(wb, true);
+        else if(pressure_bytes <= LIBDB_NVM_FLUSH_LOW_BYTES) write_buffer_set_pressure_locked(wb, false);
+        c->pressure_changes = wb->pressure_changes;
+    }
     c->sampled_bytes = bytes;
     if(bytes > c->peak_bytes) c->peak_bytes = bytes;
+    if(pressure_bytes > c->pressure_peak_bytes) c->pressure_peak_bytes = pressure_bytes;
     c->last_sample_ns = now_ns;
     c->sampled = true;
+}
+static void nvm_sample(struct db *db, uint64_t now_ns) {
+    pthread_mutex_lock(&g_mutex_lock_wbs);
+    nvm_sample_locked(db, now_ns);
+    pthread_mutex_unlock(&g_mutex_lock_wbs);
 }
 
 void space_stats_nvm_start_at(struct db *db, uint64_t now_ns) {
     if(!db || !LIBDB_DYNAMIC_FLUSH_ENABLED) return;
     struct nvm_flush_control *c = &db->nvm_flush;
     c->sampled = false;
-    c->peak_bytes = c->pressure_changes = 0;
-    atomic_store_explicit(&c->pressure, false, memory_order_relaxed);
-    nvm_sample(db, now_ns);
+    c->peak_bytes = c->pressure_changes = c->pressure_peak_bytes = 0;
+    pthread_mutex_lock(&g_mutex_lock_wbs);
+    if(db->write_buffer){
+        db->write_buffer->pressure_changes = 0;
+        db->write_buffer->pressure_tracking = true;
+    }
+    nvm_sample_locked(db, now_ns);
     atomic_store_explicit(&c->phase, NVM_FLUSH_WORKLOAD, memory_order_release);
+    pthread_mutex_unlock(&g_mutex_lock_wbs);
 }
 
 void space_stats_nvm_poll_at(struct db *db, uint64_t now_ns) {
@@ -177,17 +189,40 @@ void space_stats_nvm_poll(struct db *db) {
 }
 void space_stats_nvm_stop(struct db *db) {
     if(db && LIBDB_DYNAMIC_FLUSH_ENABLED &&
-       atomic_load_explicit(&db->nvm_flush.phase, memory_order_relaxed) == NVM_FLUSH_WORKLOAD)
+       atomic_load_explicit(&db->nvm_flush.phase, memory_order_relaxed) == NVM_FLUSH_WORKLOAD){
+        pthread_mutex_lock(&g_mutex_lock_wbs);
         atomic_store_explicit(&db->nvm_flush.phase, NVM_FLUSH_STOPPED, memory_order_release);
+        if(db->write_buffer){
+            db->write_buffer->pressure_tracking = false;
+            db->nvm_flush.pressure_changes = db->write_buffer->pressure_changes;
+        }
+        pthread_mutex_unlock(&g_mutex_lock_wbs);
+    }
 }
 void space_stats_nvm_print(const struct db *db, FILE *fp) {
     if(!db || !fp) return;
     fprintf(fp, "NVM flush: enabled=%d limit_bytes=%" PRIu64 " poll_ns=%" PRIu64
-        " occupancy=unreclaimed_slots phase=workload_only soft_limit=1\n",
-        LIBDB_DYNAMIC_FLUSH_ENABLED, (uint64_t)LIBDB_NVM_FLUSH_LIMIT_BYTES,
-        (uint64_t)LIBDB_NVM_FLUSH_POLL_NS);
+        " occupancy=file_budget_minus_reusable phase=workload_only soft_limit=0"
+        " low_bytes=%" PRIu64 " hard_limit_bytes=%" PRIu64 "\n",
+        LIBDB_DYNAMIC_FLUSH_ENABLED, (uint64_t)LIBDB_NVM_FLUSH_HIGH_BYTES,
+        (uint64_t)LIBDB_NVM_FLUSH_POLL_NS, (uint64_t)LIBDB_NVM_FLUSH_LOW_BYTES,
+        (uint64_t)LIBDB_WBF_CAPACITY_LIMIT_BYTES);
+    uint64_t files = 0, file_bytes = 0, file_peak = 0, reusable = 0, rejected = 0, used = 0;
+    if(db->write_buffer){
+        const struct write_buffer *wb = db->write_buffer;
+        pthread_mutex_lock(&g_mutex_lock_wbs);
+        files = wb->file_num; file_bytes = wb->file_bytes; file_peak = wb->file_peak_bytes;
+        reusable = atomic_load_explicit(&wb->reusable_slot_bytes, memory_order_relaxed);
+        rejected = wb->limit_rejections;
+        used = atomic_load_explicit(&wb->used_slot_bytes, memory_order_relaxed);
+        pthread_mutex_unlock(&g_mutex_lock_wbs);
+    }
     fprintf(fp, "nvm_used_slot_bytes=%" PRIu64 " nvm_sampled_peak_bytes=%" PRIu64
         " nvm_pressure_changes=%" PRIu64 " nvm_sampled=%d\n",
-        db->write_buffer ? atomic_load_explicit(&db->write_buffer->used_slot_bytes, memory_order_relaxed) : 0,
-        db->nvm_flush.peak_bytes, db->nvm_flush.pressure_changes, db->nvm_flush.sampled);
+        used, db->nvm_flush.peak_bytes, db->nvm_flush.pressure_changes, db->nvm_flush.sampled);
+    fprintf(fp, "wbf_file_count=%" PRIu64 " wbf_file_bytes=%" PRIu64 " wbf_file_peak_bytes=%" PRIu64
+        " wbf_reusable_slot_bytes=%" PRIu64 " nvm_pressure_bytes=%" PRIu64
+        " nvm_pressure_sampled_peak_bytes=%" PRIu64 " wbf_limit_rejections=%" PRIu64 "\n",
+        files, file_bytes, file_peak, reusable, file_bytes - reusable,
+        db->nvm_flush.pressure_peak_bytes, rejected);
 }

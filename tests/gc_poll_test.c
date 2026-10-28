@@ -84,9 +84,11 @@ int main(void) {
      * GC is inactive (recovery skips initial load). */
     struct write_buffer wb = {0};
     db.write_buffer = &wb;
+    wb.file_bytes = LIBDB_NVM_FLUSH_HIGH_BYTES;
+    assert(pthread_mutex_init(&g_mutex_lock_wbs, NULL) == 0);
     db.initial_load.complete = false;
     db.recovery_mode = 1;
-    atomic_store(&wb.used_slot_bytes, LIBDB_NVM_FLUSH_LIMIT_BYTES);
+    atomic_store(&wb.used_slot_bytes, LIBDB_NVM_FLUSH_HIGH_BYTES);
     space_stats_nvm_init(&db);
     nvm_start = fake_now;
     space_stats_nvm_start_at(&db, nvm_start);

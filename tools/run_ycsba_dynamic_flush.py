@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and compare dynamic Flush OFF then ON, one fresh uniform YCSB A run each."""
+"""Build selected dynamic Flush modes and run fresh uniform YCSB A experiments."""
 import argparse
 import csv
 import json
@@ -18,15 +18,29 @@ from summarize_ycsba import count_requests, measured_result
 
 REPO = Path(__file__).resolve().parent.parent
 MODES = (('off', 0), ('on', 1))
+#MODES = (('on', 1),)
 FIELDS = ['mode', 'dynamic_flush_enabled', 'distribution', 'workload', 'workers',
           'injectors', 'kv_size_bytes', 'cache_mib', 'tasks_per_thread', 'requests',
           'seconds', 'throughput_ops_s', 'nvm_limit_bytes', 'nvm_poll_ns',
           'nvm_used_slot_bytes', 'nvm_sampled_peak_bytes', 'nvm_pressure_changes',
-          'nvm_sampled', 'status', 'error']
+          'nvm_sampled', 'nvm_low_bytes', 'nvm_hard_limit_bytes', 'wbf_file_count',
+          'wbf_file_bytes', 'wbf_file_peak_bytes', 'wbf_reusable_slot_bytes',
+          'nvm_pressure_bytes', 'nvm_pressure_sampled_peak_bytes', 'wbf_limit_rejections',
+          'wbf_capacity_verified', 'wbf_capacity_limit_hit', 'status', 'error']
 NVM_CONFIG = re.compile(r'NVM flush: enabled=([01]) limit_bytes=(\d+) poll_ns=(\d+) '
                         r'occupancy=unreclaimed_slots phase=workload_only soft_limit=1')
 NVM_STATS = re.compile(r'nvm_used_slot_bytes=(\d+) nvm_sampled_peak_bytes=(\d+) '
                        r'nvm_pressure_changes=(\d+) nvm_sampled=([01])')
+
+NVM_CONFIG_V2 = re.compile(r'NVM flush: enabled=([01]) limit_bytes=(\d+) poll_ns=(\d+) '
+    r'occupancy=file_budget_minus_reusable phase=workload_only soft_limit=0 '
+    r'low_bytes=(\d+) hard_limit_bytes=(\d+)')
+BUDGET_KEYS = ('wbf_file_count', 'wbf_file_bytes', 'wbf_file_peak_bytes',
+              'wbf_reusable_slot_bytes', 'nvm_pressure_bytes',
+              'nvm_pressure_sampled_peak_bytes', 'wbf_limit_rejections')
+NVM_BUDGET = re.compile(' '.join(key + r'=(\d+)' for key in BUDGET_KEYS))
+NVM_REJECTION = re.compile(r'WBF hard limit: file_bytes=(\d+) requested_bytes=(\d+) '
+                          r'hard_limit_bytes=(\d+) limit_rejections=(\d+)')
 
 
 def help_parser():
@@ -43,8 +57,10 @@ Environment defaults:
   BUILD_JOBS=6 SPDK_ROOT=<repo>/../spdk RESULT_BASE=<repo>/results USE_SUDO=1
   TIMEOUT_SECONDS=0 KILL_AFTER_SECONDS=30
   SKIP_DRIVER_CHECK=0 (1 is intended only for mock-program tests)
-Always runs OFF once, then ON once. REPEATS and BINARY are ignored.
-Both binaries are built in this invocation's result directory before either run.
+LIBDB_DYNAMIC_FLUSH_MODES defaults to the source MODES setting (OFF then ON).
+Set LIBDB_DYNAMIC_FLUSH_MODES=on or off to run only that mode once.
+REPEATS and BINARY are ignored.
+Selected binaries are built in this invocation's result directory before any run.
 Only LIBDB_DYNAMIC_FLUSH_ENABLED differs; other settings come from current source.
 Requires cmake and stdbuf. Build/runtime stdout and stderr appear live in this
 terminal and are also saved to logs. TIMEOUT_SECONDS applies to each configure,
@@ -62,7 +78,14 @@ def configuration():
         ('BOUNDARY_SIZE', 1000, 1, 2147483647), ('BUILD_JOBS', 6, 1, 1024),
         ('USE_SUDO', 1, 0, 1), ('SKIP_DRIVER_CHECK', 0, 0, 1),
         ('TIMEOUT_SECONDS', 0, 0, 2147483647), ('KILL_AFTER_SECONDS', 30, 1, 2147483647))}
-    c['MODES'] = MODES
+    requested_modes = os.environ.get('LIBDB_DYNAMIC_FLUSH_MODES')
+    if requested_modes is None:
+        c['MODES'] = MODES
+    else:
+        names = requested_modes.split(',')
+        if names not in (['on'], ['off'], ['off', 'on']):
+            raise ValueError('LIBDB_DYNAMIC_FLUSH_MODES must be on, off, or off,on')
+        c['MODES'] = tuple((name, int(name == 'on')) for name in names)
     c['REPEATS'] = 1
     if c['THREADS'] + c['LOAD_INJECTORS'] + 1 > 128:
         raise ValueError('threads + injectors + 1 must not exceed 128')
@@ -119,37 +142,56 @@ def save_json(path, value):
 
 
 def nvm_metrics(log, result, enabled):
-    """Require a final snapshot in both streams, and validate every mode line."""
-    snapshots = []
+    """Parse both generations without presenting legacy soft limits as hard caps."""
+    snapshots, budgets = [], []
     geometry = None
     for path in (log, result):
-        configs, stats = [], []
+        configs, stats, budget = [], [], []
         with path.open() as stream:
             for line in stream:
-                match = NVM_CONFIG.fullmatch(line.rstrip('\n'))
+                line = line.rstrip('\n')
+                match = NVM_CONFIG_V2.fullmatch(line)
                 if match:
                     configs.append(tuple(map(int, match.groups())))
-                match = NVM_STATS.fullmatch(line.rstrip('\n'))
-                if match:
-                    stats.append(tuple(map(int, match.groups())))
+                else:
+                    match = NVM_CONFIG.fullmatch(line)
+                    if match: configs.append(tuple(map(int, match.groups())) + (None, None))
+                match = NVM_STATS.fullmatch(line)
+                if match: stats.append(tuple(map(int, match.groups())))
+                match = NVM_BUDGET.fullmatch(line)
+                if match: budget.append(tuple(map(int, match.groups())))
         if not configs or not stats:
             raise ValueError(f'{path.name}: missing NVM flush configuration or final statistics')
-        for mode, limit, interval in configs:
+        for mode, high, interval, low, hard in configs:
             if mode != enabled:
                 raise ValueError(f'{path.name}: dynamic Flush mode mismatch: expected {enabled}, got {mode}')
-            if not limit or not interval:
-                raise ValueError('invalid NVM flush limit or poll interval')
-            if geometry is not None and geometry != (limit, interval):
+            if not high or not interval or (hard is not None and not 0 <= low < high < hard):
+                raise ValueError('invalid NVM flush limit or watermarks')
+            current = high, interval, low, hard
+            if geometry is not None and geometry != current:
                 raise ValueError('inconsistent NVM flush geometry')
-            geometry = limit, interval
+            geometry = current
         if stats[-1][-1] != enabled:
             raise ValueError('NVM sampling state does not match the measured mode')
         snapshots.append(stats[-1])
-    if snapshots[0] != snapshots[1]:
+        if geometry[3] is not None:
+            if not budget: raise ValueError('missing WBF capacity statistics')
+            for files, size, peak, reusable, pressure, pressure_peak, rejected in budget:
+                if not (0 <= reusable <= size <= peak <= geometry[3]) or pressure != size - reusable:
+                    raise ValueError('invalid or exceeded WBF capacity')
+                if pressure_peak > geometry[3] or bool(files) != bool(size):
+                    raise ValueError('invalid WBF capacity statistics')
+            budgets.append(budget[-1])
+    if snapshots[0] != snapshots[1] or (budgets and budgets[0] != budgets[1]):
         raise ValueError('log and result NVM snapshots disagree')
-    return dict(zip(('nvm_limit_bytes', 'nvm_poll_ns', 'nvm_used_slot_bytes',
-                     'nvm_sampled_peak_bytes', 'nvm_pressure_changes', 'nvm_sampled'),
-                    geometry + snapshots[0]))
+    metrics = dict(zip(('nvm_limit_bytes', 'nvm_poll_ns', 'nvm_low_bytes', 'nvm_hard_limit_bytes'), geometry))
+    metrics.update(zip(('nvm_used_slot_bytes', 'nvm_sampled_peak_bytes',
+                        'nvm_pressure_changes', 'nvm_sampled'), snapshots[0]))
+    metrics['wbf_capacity_verified'] = int(bool(budgets))
+    if budgets:
+        metrics.update(zip(BUDGET_KEYS, budgets[0]))
+        metrics['wbf_capacity_limit_hit'] = int(metrics['wbf_limit_rejections'] > 0)
+    return metrics
 
 
 def run(c):
@@ -160,7 +202,7 @@ def run(c):
     summary = result / 'summary.csv'
     with summary.open('x', newline='') as stream:
         csv.DictWriter(stream, fieldnames=FIELDS).writeheader()
-    c['BINARIES'] = {mode: result / 'build' / mode / 'test' for mode, _ in MODES}
+    c['BINARIES'] = {mode: result / 'build' / mode / 'test' for mode, _ in c['MODES']}
     save_json(result / 'config.json', c)
     status = dict(status='running', stage='build', error='')
     pmem = None
@@ -169,7 +211,7 @@ def run(c):
         # Builds are unprivileged when the script itself is unprivileged. Their
         # process groups use the same streaming/timeout handler as the database.
         build_control = dict(c, ROOT_COMMAND=[])
-        for mode, enabled in MODES:
+        for mode, enabled in c['MODES']:
             build_dir = c['BINARIES'][mode].parent
             commands = (
                 ('configure', [c['CMAKE'], '-S', str(REPO), '-B', str(build_dir),
@@ -184,19 +226,20 @@ def run(c):
                 execute(command, result / f'{step}_{mode}.log', build_control)
             if not c['BINARIES'][mode].is_file() or not os.access(c['BINARIES'][mode], os.X_OK):
                 raise ValueError(f'build did not produce executable {c["BINARIES"][mode]}')
-        # No experimental PMEM or SSD access until both builds succeed.
+        # No experimental PMEM or SSD access until all selected builds succeed.
         status['stage'] = 'prepare_pmem'
         pmem = Path(subprocess.check_output(c['ROOT_COMMAND'] + ['mktemp', '-d',
             str(c['PMEM_BASE'] / 'libdb_ycsba_dynamic_flush_XXXXXXXXXX')], text=True).strip())
         c['PMEM_DIR'] = pmem
         save_json(result / 'config.json', c)
-        for mode, enabled in MODES:
+        for mode, enabled in c['MODES']:
             label = f'{mode}_uniform_A'
             status['stage'] = label
             row = dict(mode=mode, dynamic_flush_enabled=enabled, distribution='uniform', workload='A',
                 workers=c['THREADS'], injectors=c['LOAD_INJECTORS'], kv_size_bytes=c['KV_SIZE'],
                 cache_mib=c['CACHE_SIZE_MB'], tasks_per_thread=c['TASKS_PER_THREAD'],
                 requests=c['UNIFORM_YCSBA_FILE_REQUESTS'], status='prepare_failed', error='')
+            log = None
             try:
                 database = pmem / mode
                 subprocess.run(c['ROOT_COMMAND'] + ['mkdir', '--', str(database)], check=True)
@@ -216,10 +259,24 @@ def run(c):
                 seconds, rate = measured_result(log, args['output'], str(args['test']),
                     row['requests'], c['UNIFORM_WARM_FILE_REQUESTS'])
                 metrics = nvm_metrics(log, args['output'], enabled)
-                if rows and any(metrics[k] != rows[0][k] for k in ('nvm_limit_bytes', 'nvm_poll_ns')):
+                if rows and any(metrics[k] != rows[0][k] for k in ('nvm_limit_bytes', 'nvm_poll_ns', 'nvm_low_bytes', 'nvm_hard_limit_bytes')):
                     raise ValueError('OFF and ON use different NVM limits or sampling intervals')
-                row.update(metrics, seconds=seconds, throughput_ops_s=rate, status='ok')
+                row.update(metrics, seconds=seconds, throughput_ops_s=rate)
+                if metrics.get('wbf_capacity_limit_hit'):
+                    row['status'] = 'capacity_limit'
+                    raise ValueError('WBF hard capacity limit was reached')
+                row['status'] = 'ok'
             except Exception as error:
+                if log is not None and log.exists():
+                    # A hard rejection terminates before final statistics exist.
+                    with log.open() as stream:
+                        for line in stream:
+                            match = NVM_REJECTION.search(line)
+                            if match:
+                                size, requested, hard, rejected = map(int, match.groups())
+                                row.update(wbf_file_bytes=size, nvm_hard_limit_bytes=hard,
+                                    wbf_limit_rejections=rejected, wbf_capacity_limit_hit=1,
+                                    status='capacity_limit')
                 if isinstance(error, Interrupted): row['status'] = 'interrupted'
                 elif isinstance(error, TimeoutError): row['status'] = 'timeout'
                 row['error'] = str(error)
@@ -231,9 +288,13 @@ def run(c):
             # Reclaim the completed phase before the next one so the two PMEM
             # populations do not compete for capacity. Both paths are private.
             subprocess.run(c['ROOT_COMMAND'] + ['rm', '-rf', '--', str(database)], check=True)
-        off, on = (float(row['throughput_ops_s']) for row in rows)
-        comparison = (f'Uniform YCSB A: OFF={off:.6f} ops/s, ON={on:.6f} ops/s\n'
-                      f'ON relative to OFF: {(on / off - 1) * 100:+.2f}%\n')
+        if len(rows) == 2:
+            off, on = (float(row['throughput_ops_s']) for row in rows)
+            comparison = (f'Uniform YCSB A: OFF={off:.6f} ops/s, ON={on:.6f} ops/s\n'
+                          f'ON relative to OFF: {(on / off - 1) * 100:+.2f}%\n')
+        else:
+            comparison = (f"Uniform YCSB A: {rows[0]['mode'].upper()}="
+                          f"{float(rows[0]['throughput_ops_s']):.6f} ops/s (single mode)\n")
         (result / 'comparison.txt').write_text(comparison)
         print(summary.read_text(), end='', flush=True)
         print(comparison, end='', flush=True)

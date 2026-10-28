@@ -55,21 +55,31 @@ _Static_assert(LIBDB_SUBSPACE_MERGE_LOWER_THRESHOLD > 0 &&
 /* Reserved lower-fence marker for an interrupted persistent group split. */
 #define LIBDB_INVALID_GROUP_BOUNDARY             UINT64_MAX
 
-/* Dynamic flush applies only to the measured workload. Soft occupancy limit. */
+/* Workload-only hysteresis; the WBF file capacity cap applies in all phases. */
 #ifndef LIBDB_DYNAMIC_FLUSH_ENABLED
 #define LIBDB_DYNAMIC_FLUSH_ENABLED 1
 #endif
-#ifndef LIBDB_NVM_FLUSH_LIMIT_BYTES
-#define LIBDB_NVM_FLUSH_LIMIT_BYTES (UINT64_C(16) * 1024 * 1024 * 1024)
+#ifndef LIBDB_WBF_CAPACITY_LIMIT_BYTES
+#define LIBDB_WBF_CAPACITY_LIMIT_BYTES (UINT64_C(16) * 1024 * 1024 * 1024)
+#endif
+#ifndef LIBDB_NVM_FLUSH_HIGH_BYTES
+#define LIBDB_NVM_FLUSH_HIGH_BYTES (UINT64_C(14) * 1024 * 1024 * 1024)
+#endif
+#ifndef LIBDB_NVM_FLUSH_LOW_BYTES
+#define LIBDB_NVM_FLUSH_LOW_BYTES (UINT64_C(12) * 1024 * 1024 * 1024)
 #endif
 #ifndef LIBDB_NVM_FLUSH_POLL_NS
 #define LIBDB_NVM_FLUSH_POLL_NS UINT64_C(100000000)
 #endif
-_Static_assert(LIBDB_NVM_FLUSH_LIMIT_BYTES > 0, "NVM flush limit must be positive");
+_Static_assert(LIBDB_NVM_FLUSH_LOW_BYTES < LIBDB_NVM_FLUSH_HIGH_BYTES &&
+               LIBDB_NVM_FLUSH_HIGH_BYTES < LIBDB_WBF_CAPACITY_LIMIT_BYTES,
+               "require NVM low watermark < high watermark < WBF capacity limit");
 _Static_assert(LIBDB_NVM_FLUSH_POLL_NS > 0, "NVM poll interval must be positive");
 
 /* Persistent write-buffer files. */
+#ifndef LIBDB_WBF_FILE_SIZE
 #define LIBDB_WBF_FILE_SIZE                     (1ULL * 1024 * 1024 * 1024)
+#endif
 #define LIBDB_WBF_SEGMENT_SIZE                  (4U * 1024 * 1024)
 #define LIBDB_WBF_SEGMENTS_PER_FILE             256
 #define LIBDB_WBF_MIN_SLOT_SIZE                 32U

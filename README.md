@@ -1,6 +1,6 @@
 # LibDB
 
-当前版本：**0.1.0**。版本更新和兼容性说明见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本：**0.2.0**。版本更新和兼容性说明见 [CHANGELOG.md](CHANGELOG.md)。
 
 本仓库提供 LibDB 的可复现实验代码和脚本。下面只给出从编译到运行 YCSB A/C 与 recovery 的最短流程。
 
@@ -230,11 +230,12 @@ Bash 入口调用 Python 3 标准库工具，无第三方 Python 依赖。`SKIP_
 sudo ./run_ycsba_dynamic_flush.sh
 ```
 
-脚本先从当前源码独立构建动态 Flush **关闭（0）** 和 **开启（1）** 两个版本，两个版本
-均构建成功后，按 **OFF → ON** 顺序各运行一次 uniform YCSB A。每次创建全新数据库，
-依次执行 load、缓存预热和正式 A；两次使用相同输入和参数。编译时仅
-`LIBDB_DYNAMIC_FLUSH_ENABLED` 不同，其他配置来自当前源码，包括 GC 策略及当前默认的
-16GiB / 100ms NVM 控制参数。开启版本仍只在正式 workload 使用动态 Flush。
+脚本默认从当前源码独立构建动态 Flush **OFF、ON** 两个版本，均构建成功后
+按 **OFF → ON** 各运行一次 uniform YCSB A。设置 `LIBDB_DYNAMIC_FLUSH_MODES=on`
+或 `off` 可仅运行对应模式。每次创建全新数据库，依次执行 load、缓存预热和正式 A；
+两种模式使用相同输入和参数，编译时仅 `LIBDB_DYNAMIC_FLUSH_ENABLED` 不同。
+默认采用 16GiB WBF 文件硬上限、14GiB/12GiB 高低水位及 100ms 采样周期。
+文件硬上限两种模式全程有效；开启版本仍只在正式 workload 使用动态 Flush。
 
 **编译输出、数据库 stdout 和 stderr 都会实时出现在运行脚本的终端中，同时保存日志。**
 数据库使用 `stdbuf -oL -eL` 启动，避免 C 标准输出接入管道后变成整块缓冲；无需另开终端
@@ -251,11 +252,12 @@ sudo ./run_ycsba_dynamic_flush.sh
 | `UNIFORM_WARM_FILE`、`UNIFORM_YCSBA_FILE` | 根目录下 `uniform/warm.txt`、`uniform/ycsba.txt` |
 | `BUILD_JOBS`、`SPDK_ROOT` | 6；项目同级 `spdk` 目录 |
 | `RESULT_BASE` | 项目下 `results` |
+| `LIBDB_DYNAMIC_FLUSH_MODES` | 当前源码默认 `off,on`；可选 `on` 或 `off` |
 | `TIMEOUT_SECONDS` | 0（不限时）；非零时分别限制每个配置、构建或数据库进程 |
 | `KILL_AFTER_SECONDS`、`USE_SUDO` | 30；1（非 root 用户通过 sudo 准备 PMEM、运行数据库） |
 
 设备、线程、KV/cache 等环境变量与上方 A/F 脚本一致。`REPEATS` 和 `BINARY` 被忽略：
-固定各跑一次，并使用本次构建的两个二进制。需要 `cmake`、`stdbuf` 及正常编译依赖。
+所选模式各跑一次，并使用本次构建的二进制。需要 `cmake`、`stdbuf` 及正常编译依赖。
 例如修改编译并行度和 worker 数：
 
 ```bash
@@ -264,10 +266,10 @@ sudo env BUILD_JOBS=8 THREADS=16 ./run_ycsba_dynamic_flush.sh
 
 每次调用生成 `results/ycsba_dynamic_flush_<时间>_<唯一标识>/`，保留：
 
-- `build/off/test`、`build/on/test` 以及各自构建目录；不覆盖现有 `build/test`，不修改源码配置。
+- 所选模式对应的 `build/off/test`、`build/on/test` 及构建目录；不覆盖现有 `build/test`，不修改源码配置。
 - `config.json`、配置/构建/运行命令 JSON、构建日志、`off_uniform_A.log`、`on_uniform_A.log` 和对应 `.result.txt`。
 - `summary.csv`：每种模式的正式耗时、吞吐量、NVM 最终槽位占用、采样峰值、压力切换次数及状态。
-- `comparison.txt`：OFF、ON 吞吐量及 `(ON / OFF - 1) * 100%`；`status.json`：执行状态和失败阶段。
+- `comparison.txt`：双模式时包含 OFF、ON 吞吐量及 `(ON / OFF - 1) * 100%`，单模式时只报告该模式吞吐量；`status.json`：执行状态和失败阶段。
 
 仅从正式阶段提取吞吐量，不计 load、预热。脚本核对请求数、日志与结果文件的 NVM
 开关和统计，并检查两次预算和采样周期一致。关闭模式未启用采样，其采样峰值、切换次数
@@ -317,38 +319,55 @@ python3 tests/test_ycsbe_latency.py -v
 python3 tools/summarize_ycsbe_latency.py results/<本次运行目录>/summary.csv
 ```
 
-### 动态 NVM Flush
+### 动态 NVM Flush 与 WBF 文件硬上限
 
-动态 Flush 只在正式 workload 请求注入前启用；初始 load、cache 预热和测试请求文件读取期间
-使用原有固定局部阈值。main 在 workload 完成轮询中每 100ms 采样 WBF 的未回收槽位字节数：
-小于 16GiB 时发布压力标志 0，延后 Flush；大于等于 16GiB 时发布 1，允许所属 worker
-刷出 `buffered_size > BLOCK_SIZE * Flush_Blcok_Num` 的组（默认严格超过 16KiB）。
+WBF 文件容量总和在所有阶段严格限制为 16GiB；默认每个文件 1GiB，最多创建 16 个。
+初始化、load、预热、正式 workload 和 recovery 均受此限制，关闭动态 Flush 也不解除
+文件限额。扩容在创建文件前持有统一互斥锁检查预算，并发请求不能各自绕过检查。
+恢复先统计全部 WBF 文件；总容量超过预算时拒绝启动，不删除、截断或迁移原文件。
 
-`config.h` 中的以下宏均支持编译时覆盖，修改后需重新编译：
+动态 Flush 仅在正式 workload 生效。main 每 100ms 按以下口径判断压力：
+
+`压力占用 = 已创建 WBF 文件总容量 − 可立即复用的空闲槽位容量`
+
+达到 14GiB 时置压力标志为 1，降到 12GiB 或以下时置 0，中间区间保持原状态。
+扩容慢路径达到高水位时也立即置 1，不等待 main 的下一次采样。文件总量不会因 Flush
+下降，但实际归还的空闲槽位增加，可以使压力占用下降并恢复延后。未分配成槽位的预留
+空间和 PMDK 文件开销均计入压力；原有未回收槽位字节数保留为独立诊断数据。
+
+`config.h` 支持以下编译配置，修改后需重新编译：
 
 | 宏 | 默认值 |
 | --- | --- |
-| `LIBDB_DYNAMIC_FLUSH_ENABLED` | `1`，设为 `0` 恢复固定局部阈值行为 |
-| `LIBDB_NVM_FLUSH_LIMIT_BYTES` | `16 * 1024 * 1024 * 1024` 字节 |
+| `LIBDB_DYNAMIC_FLUSH_ENABLED` | `1`；`0` 恢复固定局部 Flush 策略，文件硬上限仍有效 |
+| `LIBDB_WBF_CAPACITY_LIMIT_BYTES` | `16GiB` 文件硬上限 |
+| `LIBDB_NVM_FLUSH_HIGH_BYTES` | `14GiB` 高水位 |
+| `LIBDB_NVM_FLUSH_LOW_BYTES` | `12GiB` 低水位 |
 | `LIBDB_NVM_FLUSH_POLL_NS` | `100000000` 纳秒 |
 
-占用按记录实际申请的 2 的幂槽位大小统计，包括记录头和内部对齐浪费。覆盖写、删除和
-Flush 完成后实际归还槽位才扣减；正在写 SSD 的冻结批次仍计入占用。恢复启动时扫描
-所有 WBF 有效槽位重建计数，尚未回收的旧版本也计入，且不依赖初始 load 是否执行。
-分裂、合并只移动索引，不改变占用。回收失败不会把无法复用的空间当成已释放空间。
+编译检查要求 `低水位 < 高水位 < 硬上限`。旧 `LIBDB_NVM_FLUSH_LIMIT_BYTES` 已由高低水位
+配置替代；实验脚本仅覆盖动态开关，其他数值仍来自源码配置。
 
-每个 worker 用按路由 key 去重的延后队列保存候选组；压力为 1 时每次维护轮询最多处理
-16 个条目，即使没有后续写入也能启动 Flush。压力解除后停止新的压力 Flush，已提交的
-I/O 正常完成。main 收到全部正式请求结果后立即停止新的压力 Flush；退出时排空已提交
-I/O 和必要维护，不强制刷空延后组，也不会因延后队列非空而等待。
+空闲量按实际槽位大小统计：新 segment 成功加入 worker 空闲链表后增加，取出槽位时
+减少，覆盖写、删除、Flush 完成后成功归还才增加。Flush 提交和回收失败不增加空闲量。
+recovery 仍会重建未回收记录计数，但未恢复到可用空闲链表的空槽位不计入可复用空间。
 
-16GiB 是软阈值，采样与 I/O 延迟可能导致超出，且不保证所有工作负载都会填满预算。
-该口径不包含空闲槽位、WBF 文件预分配、PMDK 元数据和 NVM 索引，不是物理文件大小上限。
-文件不会因 Flush 缩小，本改动不提供文件回收、硬分配限额或写入背压。
+单组 Flush 条件始终为 `buffered_size > BLOCK_SIZE * Flush_Blcok_Num`，默认严格超过
+16KiB。延后队列仍按路由 key 去重，每次维护轮询最多处理 16 个条目；无后续写入的组
+也能响应压力。正式 workload 完成后停止新的压力 Flush，排空已提交 I/O 和必要维护，
+不强制刷空延后组。
 
-启动和结束日志输出配置；结束统计包括 `nvm_used_slot_bytes`、`nvm_sampled_peak_bytes`
-和 `nvm_pressure_changes`。峰值是正式 workload 的采样峰值，不是逐次分配的瞬时峰值。
-新增测试以 64KiB 小预算验证完整压力循环、忙组/资源重试、分裂合并和停机；真实 PMDK
-临时文件测试覆盖分配回收、并发计数及恢复。新建 segment 使用 PMDK 返回的准确地址并
-清零，修复旧分配器向下对齐可能覆盖对象前元数据的问题；持久化结构格式保持不变。
-占用重建遇到非空但无法解析的槽位会报错退出，不尝试修复已有损坏数据。
+本版本不增加分配等待、背压、跨 worker 空闲共享或不足 16KiB 的紧急 Flush。如果局部
+槽位不足且扩容将突破预算，打印 `WBF hard limit` 并沿用分配失败终止路径，绝不创建
+超预算文件。提前水位用于避免触碰限额，但不保证所有负载都能持续写入。16GiB 只约束
+WBF 文件容量，不包含 leaf-node 索引或其他文件系统开销。
+
+日志输出文件数、文件容量及峰值、可复用槽位、压力占用及采样峰值、高低水位、硬上限、
+上限拒绝次数。`nvm_used_slot_bytes` 和 `nvm_sampled_peak_bytes` 仍表示原来的未回收槽位
+统计；新字段 `nvm_pressure_sampled_peak_bytes` 表示压力口径的采样峰值。文件峰值在每次
+创建时记录，不依赖周期采样。实验汇总同时识别新旧日志，旧日志不会被标记为硬上限已验证；
+出现容量拒绝时明确报告 `capacity_limit`，即使进程已在最终统计前退出。
+
+实验脚本保留源码当前默认的 ON 单模式；可用 `LIBDB_DYNAMIC_FLUSH_MODES=off,on` 运行
+OFF/ON 对比。新实验验收要求文件容量峰值不超过 16GiB、正常完成、上限拒绝次数为 0。
+无设备测试以小预算临时 PMDK 文件覆盖并发扩容、回收复用及恢复拒绝；不触碰既有实验文件。
