@@ -9,62 +9,6 @@
 #include "kvbuffer.h"
 #include "write_buffer_index.h"
 #include <stdint.h>
-/*
-先修改索引
-再释放块
-*/
-
-/*
- * 计算write_buffer_index中所有数据的总大小
- */
-int calculate_buffer_index_size(struct write_buffer_index *buffer_index) {
-    if (buffer_index == NULL || buffer_index->head == NULL) {
-        return 0;
-    }
-
-    int total_size = 0;
-    struct write_buffer_index_node *node = buffer_index->head->forward[0];
-
-    while (node != NULL) {
-        total_size += node->size;
-        node = node->forward[0];
-    }
-
-    return total_size;
-}
-
-/*
- * 从write_buffer_index中按照键大小从小到大读取足够的数据
- * 返回实际读取的数据大小
- */
-int extract_buffer_index_data(char *buffer, struct write_buffer_index *buffer_index,
-                              int needed_size, key_type *extracted_keys, int *extracted_keys_count) {
-    if (buffer_index == NULL || buffer_index->head == NULL) {
-        *extracted_keys_count = 0;
-        return 0;
-    }
-
-    int total_size = 0;
-    int keys_count = 0;
-    struct write_buffer_index_node *node = buffer_index->head->forward[0];
-
-    // 从前向后遍历write_buffer_index（键从小到大）
-    while (node != NULL && total_size < needed_size) {
-        // 从NVM缓存中读取数据
-        char *data = (char *)pmemobj_direct(node->id);
-        if (data != NULL) {
-            memcpy(buffer + total_size, data, node->size);
-            extracted_keys[keys_count] = node->key;
-            keys_count++;
-            total_size += node->size;
-        }
-        node = node->forward[0];
-    }
-
-    *extracted_keys_count = keys_count;
-    return total_size;
-}
-
 int block_exist(uint32_t block ,uint32_t * block_array ,int block_array_size_tmp){
     for (int i = 0; i < block_array_size_tmp; i++)
         if (block_array[i] == block)
@@ -101,199 +45,299 @@ static struct redundant_element * redundant_element_find(uint32_t block,
 }
 
 
-void garbadge_collection_cb_write_cb(void *arg, const struct spdk_nvme_cpl *completnio){
-    struct task * task = (struct task *)arg;
-    struct thread * thread = (struct thread *)task->thread;
-    uint64_t start_time , end_time;
-    struct subspace_info * subspace_info = (struct subspace_info *)task->subspace_info;
-    start_time = spdk_get_ticks();
-    if(spdk_nvme_cpl_is_error(completnio)){
-        task->gc_io_failed = 1;
-        fprintf(stderr, "GC SSD write completion reported an error\n");
-    }
-    task->block_completed ++;
-    if(task->block_completed >= task->total_block_num){
-        if(task->gc_io_failed){
-            fprintf(stderr, "GC aborted before slot updates because an SSD write failed\n");
-            exit(EXIT_FAILURE);
-        }
-        if(nvm_index_commit_slot_updates(
-               thread->index->nvm_index,
-               (const struct nvm_slot_update *)task->gc_slot_updates,
-               (uint32_t)task->gc_slot_update_count) != 0){
-            fprintf(stderr, "GC slot update failed; old SSD blocks were not released\n");
-            exit(EXIT_FAILURE);
-        }
+/* Private, volatile GC state. Persistent slots remain unchanged until every
+ * destination is durable. A packed block number is only a staging ordinal. */
+#define GC_MAX_ENTRIES (SUBSPACE_MAX_SLOT * SLOT_MAX_ELEMENT)
+struct gc_entry {
+    struct slot_element item;
+    int packed_block;
+};
+struct gc_plan {
+    struct slot_element old[GC_MAX_ENTRIES];
+    struct gc_entry entries[GC_MAX_ENTRIES];
+    uint32_t old_count, count, slot_count, update_count;
+    struct nvm_slot_update updates[SUBSPACE_MAX_SLOT];
+    struct write_buffer_index *frozen;
+    bool returned_tail;
+    uint32_t destinations[LIBDB_TASK_BUFFER_BLOCK_COUNT];
+    uint32_t write_count;
+};
 
-        free(task->gc_slot_updates);
-        task->gc_slot_updates = NULL;
-        task->gc_slot_update_count = 0;
-        reclaim_blocks(thread, task->block_array_to_gc, task->total_block_num_to_gc);
-        maintenance_request_flush(thread, subspace_info->boundary);
-        subspace_info->is_gc = 0;
-        free(task->block_array_to_gc);
-        subspace_info->total_block_num -=
-            (task->total_block_num_to_gc - task->block_completed);
-        free_task(task);
-    }
-    end_time = spdk_get_ticks();
-    insert_breakdown[thread->thread].gc_cb_time += end_time - start_time;
-    return ;
+static void gc_fatal(const char *reason){
+    fprintf(stderr, "GC: %s; source blocks retained\n", reason);
+    exit(EXIT_FAILURE);
 }
 
-/*
-1. 重组被 GC 块中的有效 KV。
-2. 只在 DRAM 中构造受影响 slot 的完整后镜像；SSD 写完成后再逐个持久化。
-*/
-int fill_buffer_and_update_index(char * buffer , struct subspace_info * subspace_info , struct thread * thread,
- uint32_t * block , int block_size , uint32_t * new_block,
- struct nvm_slot_update **slot_updates_out, int *slot_update_count_out){
-    struct slot_element * slot_element;
-    uint32_t block_curr = 0;
-    int off = 0;
-    /* 记录当前块中 KV 个数及最后一个 KV 的信息，用于尾部小块优化 */
-    char * buffer_to_store = (char *)malloc(sizeof(char)* BLOCK_SIZE * block_size);
-    struct nvm_slot_update *slot_updates = (struct nvm_slot_update *)calloc(
-        SUBSPACE_MAX_SLOT, sizeof(struct nvm_slot_update));
-    int slot_update_count = 0;
-    if(buffer_to_store == NULL || slot_updates == NULL){
-        fprintf(stderr, "failed to allocate GC staging buffers\n");
-        free(buffer_to_store);
-        free(slot_updates);
-        return -1;
+static int gc_entry_compare(const void *a, const void *b){
+    key_type x = ((const struct gc_entry *)a)->item.key;
+    key_type y = ((const struct gc_entry *)b)->item.key;
+    return (x > y) - (x < y);
+}
+
+/* Validate the entire prefix before detaching anything. Never skip an oversized
+ * first/next record, and never consume a partial fit. */
+static size_t gc_fill_prefix_count(struct gc_plan *plan,
+                                  struct subspace_info *group, size_t needed){
+    size_t bytes = 0, keys = 0, projected = plan->count;
+    for(struct write_buffer_index_node *n = group->buffer_index->head->forward[0];
+        n && bytes < needed; n = n->forward[0]){
+        if(n->size > needed - bytes) return 0;
+        struct kv_record_view view;
+        if(kv_record_decode_for_key(pmemobj_direct(n->id), n->size, n->key, &view) ||
+           view.record_size != n->size) gc_fatal("invalid PMEM fill record");
+        bool exists = false;
+        for(uint32_t i = 0; i < plan->count; i++)
+            if(plan->entries[i].item.key == n->key) { exists = true; break; }
+        if(!exists) projected++;
+        if(projected > SUBSPACE_MAX_KEY || projected > GC_MAX_ENTRIES) return 0;
+        bytes += n->size;
+        keys++;
     }
-    int used_block;
-    int k;
+    return bytes == needed ? keys : 0;
+}
 
-    new_block[0] = get_free_block(&thread->curr_segment , thread->fs);
+static void gc_return_record(struct thread *thread, struct subspace_info *group,
+                             const struct slot_element *entry, const char *record){
+    struct kv_record_view view;
+    if(kv_record_decode_for_key(record, entry->addr.size, entry->key, &view) ||
+       view.record_size != entry->addr.size) gc_fatal("invalid SSD tail record");
+    for(struct write_buffer_index *b = group->buffer_index; b; b = b->next){
+        struct write_buffer_index_node *n = write_buffer_index_search(b, entry->key);
+        if(!n) continue;
+        struct kv_record_view current;
+        if(kv_record_decode_for_key(pmemobj_direct(n->id), n->size, n->key, &current))
+            gc_fatal("invalid existing PMEM record");
+        if(current.version >= view.version) return;
+    }
+    uint16_t seq;
+    /* The normal allocator enforces the WBF hard limit and owns all accounting.
+     * Do not use insert(): migration must neither assign a version nor flush. */
+    PMEMoid id = write_buffer_insert(view.key, view.version, view.value,
+        view.value_size, thread->kvbuffer, &seq, &thread->buffer_free_head, thread->thread);
+    if(OID_IS_NULL(id)) gc_fatal("cannot persist tail in PMEM");
+    struct write_buffer_return_type old = nvm_index_insert(group, id, view.key,
+        view.record_size, seq, thread->thread);
+    if(old.size) write_buffer_free(thread->kvbuffer, old.id, old.WBF_seq,
+                                  old.size, &thread->buffer_free_head);
+}
+
+static struct gc_plan *gc_stage(struct task *task){
+    struct thread *thread = task->thread;
+    struct subspace_info *group = task->subspace_info;
+    struct gc_plan *plan = calloc(1, sizeof(*plan));
+    char *packed = calloc(LIBDB_TASK_BUFFER_BLOCK_COUNT, BLOCK_SIZE);
+    if(!plan || !packed) gc_fatal("cannot allocate staging buffers");
+    int block = 0;
+    size_t off = 0;
     access_nvm();
-    for(int i = 0 ; i < subspace_info->slot_num ; i++){
-        void *persistent_slot = pmemobj_direct(subspace_info->slot[i]);
-        if(persistent_slot == NULL){
-            access_nvm_release();
-            free(buffer_to_store);
-            free(slot_updates);
-            return -1;
+    for(uint32_t i = 0; i < group->slot_num; i++){
+        struct slot_element *entries = subspace_slot_elements(group, i);
+        if(!entries || group->slot_key_num[i] > SLOT_MAX_ELEMENT)
+            gc_fatal("invalid source slot");
+        for(uint32_t j = 0; j < group->slot_key_num[i]; j++){
+            if(plan->count == GC_MAX_ENTRIES) gc_fatal("source index too large");
+            struct gc_entry *e = &plan->entries[plan->count++];
+            e->item = entries[j];
+            e->packed_block = -1;
+            plan->old[plan->old_count++] = e->item;
+            int source = block_exist(e->item.addr.block, task->block_array, task->total_block_num);
+            if(!source) continue;
+            struct kv_record_view view;
+            size_t size = e->item.addr.size;
+            if(size > BLOCK_SIZE || e->item.addr.off + size > BLOCK_SIZE)
+                gc_fatal("record crosses source block");
+            const char *record = task->buffer + (size_t)(source - 1) * BLOCK_SIZE + e->item.addr.off;
+            if(kv_record_decode_for_key(record, size, e->item.key, &view) || view.record_size != size)
+                gc_fatal("invalid SSD record");
+            if(off + size > BLOCK_SIZE) { block++; off = 0; }
+            if(block >= LIBDB_TASK_BUFFER_BLOCK_COUNT) gc_fatal("packed output exceeds DMA buffer");
+            memcpy(packed + (size_t)block * BLOCK_SIZE + off, record, size);
+            e->packed_block = block;
+            e->item.addr.off = off;
+            off += size;
         }
-        struct nvm_slot_update *slot_update = &slot_updates[slot_update_count];
-        slot_update->slot = subspace_info->slot[i];
-        memcpy(&slot_update->image, persistent_slot, LNF_SLOT_MIN_SIZE);
-        slot_element = slot_update->image.entries;
-        int slot_changed = 0;
-        for(int j = 0 ; j < subspace_info->slot_key_num[i] ; j++){
-            /*需要把键值对复制到buffer里*/
-            k = block_exist(slot_element->addr.block , block , block_size);
-            if(k){//被gc的键值对的索引
-                if(off + slot_element->addr.size > BLOCK_SIZE){
-                    new_block[block_curr + 1] = get_free_block(&thread->curr_segment , thread->fs);
-                    block_curr ++;
-                    off = 0;
-                    /* 开始新的块，重置当前块内计数 */
-                    if(block_curr >= block_size){
-                    }
-                }
-
-                /*将buffer中的键值对复制到buffer*/
-                memcpy(buffer_to_store + BLOCK_SIZE * block_curr + off ,
-                buffer + BLOCK_SIZE * (k - 1) + slot_element->addr.off, slot_element->addr.size);
-                /* 记录当前块最后一个 KV 的信息（用于尾部少量数据写回 NVM 写缓存） */
-                slot_element->addr.block = new_block[block_curr];
-                slot_element->addr.off = off;
-                off += slot_element->addr.size;
-                slot_changed = 1;
-                block_ref_add(new_block[block_curr]);
+    }
+    if(!off) gc_fatal("empty GC selection");
+    if(block > 0 && off < BLOCK_SIZE){
+        size_t needed = BLOCK_SIZE - off;
+        size_t keys = gc_fill_prefix_count(plan, group, needed);
+        if(keys){
+            plan->frozen = write_buffer_index_take_prefix(group->buffer_index, keys, needed);
+            if(!plan->frozen) gc_fatal("cannot freeze PMEM fill prefix");
+            plan->frozen->next = group->buffer_index->next;
+            if(plan->frozen->next) plan->frozen->next->prev = plan->frozen;
+            plan->frozen->prev = group->buffer_index;
+            group->buffer_index->next = plan->frozen;
+            for(struct write_buffer_index_node *n = plan->frozen->head->forward[0]; n; n = n->forward[0]){
+                uint32_t i = 0;
+                while(i < plan->count && plan->entries[i].item.key != n->key) i++;
+                if(i == plan->count) plan->count++;
+                struct gc_entry *e = &plan->entries[i];
+                e->item = (struct slot_element){.key = n->key,
+                    .addr = {.off = off, .size = n->size}};
+                e->packed_block = block;
+                memcpy(packed + (size_t)block * BLOCK_SIZE + off, pmemobj_direct(n->id), n->size);
+                off += n->size;
+                group->buffered_size -= n->size;
             }
-            slot_element ++;
-        }
-        if(slot_changed){
-            slot_update_count++;
+            if(off != BLOCK_SIZE) gc_fatal("incomplete PMEM fill prefix");
+        } else {
+            plan->returned_tail = true;
+            uint32_t kept = 0;
+            for(uint32_t i = 0; i < plan->count; i++){
+                struct gc_entry *e = &plan->entries[i];
+                if(e->packed_block == block)
+                    gc_return_record(thread, group, &e->item,
+                        packed + (size_t)block * BLOCK_SIZE + e->item.addr.off);
+                else plan->entries[kept++] = *e;
+            }
+            plan->count = kept;
         }
     }
     access_nvm_release();
 
-    /* Keep the partial tail on SSD. Moving it into the active GWB here
-     * invalidates the staged slot addresses and may overwrite newer writes.
-     * Every staged address must name a destination that is actually written. */
-    used_block = block_curr + 1;
-
-    memcpy(buffer , buffer_to_store , used_block * BLOCK_SIZE);
-    free(buffer_to_store);
-    *slot_updates_out = slot_updates;
-    *slot_update_count_out = slot_update_count;
-    return used_block;
+    /* Allocate only referenced outputs. A fill can supersede the last live
+     * key in an earlier packed block, so even a non-tail block may disappear. */
+    for(int b = 0; b <= block; b++){
+        bool used = false;
+        for(uint32_t i = 0; i < plan->count; i++)
+            if(plan->entries[i].packed_block == b) { used = true; break; }
+        if(!used) continue;
+        int dest = get_free_block(&thread->curr_segment, thread->fs);
+        if(dest < 0) gc_fatal("out of SSD space");
+        plan->destinations[plan->write_count] = dest;
+        memcpy(task->buffer + (size_t)plan->write_count++ * BLOCK_SIZE,
+               packed + (size_t)b * BLOCK_SIZE, BLOCK_SIZE);
+        for(uint32_t i = 0; i < plan->count; i++)
+            if(plan->entries[i].packed_block == b) plan->entries[i].item.addr.block = dest;
+    }
+    free(packed);
+    qsort(plan->entries, plan->count, sizeof(*plan->entries), gc_entry_compare);
+    plan->slot_count = (plan->count + SLOT_MAX_ELEMENT - 1) / SLOT_MAX_ELEMENT;
+    if(plan->slot_count > SUBSPACE_MAX_SLOT) gc_fatal("output index exceeds slot capacity");
+    plan->update_count = plan->slot_count > group->slot_num ? plan->slot_count : group->slot_num;
+    if(plan->slot_count > group->slot_num &&
+       !nvm_index_reserve_free_nodes(thread->index->nvm_index, &thread->index_free_head,
+                                    plan->slot_count - group->slot_num))
+        gc_fatal("cannot reserve output slots");
+    for(uint32_t i = 0; i < plan->update_count; i++){
+        PMEMobjpool *pool;
+        plan->updates[i].slot = i < group->slot_num ? group->slot[i] :
+            nvm_index_get_free_node(thread->index->nvm_index, &thread->index_free_head, &pool);
+        if(OID_IS_NULL(plan->updates[i].slot)) gc_fatal("cannot allocate output slot");
+        if(i >= plan->slot_count) continue; /* zero retired slot */
+        plan->updates[i].image.boundary = group->boundary;
+        for(uint32_t j = 0; j < SLOT_MAX_ELEMENT && i * SLOT_MAX_ELEMENT + j < plan->count; j++)
+            plan->updates[i].image.entries[j] = plan->entries[i * SLOT_MAX_ELEMENT + j].item;
+    }
+    return plan;
 }
 
-void garbadge_collection_cb(void *arg, const struct spdk_nvme_cpl *completnio){
-    struct task * task = (struct task *)arg;
-    struct thread * thread = (struct thread *)task->thread;
-    struct ns_entry * ns_entry = (struct ns_entry *)thread->ns_entry;
-
-    int qpair_num = thread->thread % ctr_max_qp;
-    int rc ;
-    uint32_t * new_block;
-    uint64_t start_time , end_time;
-
-    start_time = spdk_get_ticks();
-    if(spdk_nvme_cpl_is_error(completnio)){
-        task->gc_io_failed = 1;
-        fprintf(stderr, "GC SSD read completion reported an error\n");
+static void gc_commit(struct task *task){
+    struct thread *thread = task->thread;
+    struct subspace_info *group = task->subspace_info;
+    struct gc_plan *plan = task->gc_plan;
+    if(nvm_index_commit_slot_updates(thread->index->nvm_index, plan->updates, plan->update_count))
+        gc_fatal("slot commit failed");
+    for(uint32_t i = 0; i < plan->old_count; i++){
+        block_ref_remove(plan->old[i].addr.block);
+        kvcache_delete(group->kvcache, thread->lru_list, plan->old[i].key);
     }
-    task->block_completed ++;
-    if(task->block_completed >= task->total_block_num){//块已经全部读取完
-        if(task->gc_io_failed){
-            fprintf(stderr, "GC cannot continue because an SSD read failed\n");
-            exit(EXIT_FAILURE);
+    uint32_t blocks[GC_MAX_ENTRIES], count = 0;
+    uint64_t bytes = 0;
+    for(uint32_t i = 0; i < plan->count; i++){
+        struct slot_element *e = &plan->entries[i].item;
+        block_ref_add(e->addr.block);
+        if(!block_exist(e->addr.block, blocks, count)) blocks[count++] = e->addr.block;
+        bytes += e->addr.size;
+        kvcache_delete(group->kvcache, thread->lru_list, e->key);
+    }
+    group->total_block_num = count;
+    group->redundant_size = (uint64_t)count * BLOCK_SIZE - bytes;
+    group->key_num = plan->count;
+    group->slot_num = plan->slot_count;
+    for(uint32_t i = 0; i < plan->update_count; i++){
+        if(i >= plan->slot_count){
+            nvm_index_recycle_slot(thread->index->nvm_index, &thread->index_free_head, plan->updates[i].slot);
+            group->slot[i] = OID_NULL;
+            group->slot_key_num[i] = 0;
+            group->min_key[i] = 0;
+            group->pool[i] = NULL;
+        } else {
+            group->slot[i] = plan->updates[i].slot;
+            group->pool[i] = pmemobj_pool_by_oid(group->slot[i]);
+            uint32_t remaining = plan->count - i * SLOT_MAX_ELEMENT;
+            group->slot_key_num[i] = remaining < SLOT_MAX_ELEMENT ? remaining : SLOT_MAX_ELEMENT;
+            group->min_key[i] = plan->updates[i].image.entries[0].key;
         }
+        group->need_persist[i] = false;
+    }
+    if(plan->frozen){
+        struct write_buffer_index *batch = plan->frozen;
+        batch->prev->next = batch->next;
+        if(batch->next) batch->next->prev = batch->prev;
+        for(struct write_buffer_index_node *n = batch->head->forward[0]; n; n = n->forward[0])
+            write_buffer_free(thread->kvbuffer, n->id, n->WBF_seq, n->size, &thread->buffer_free_head);
+        write_buffer_index_destroy(batch);
+    }
+    /* This also reclaims unselected source blocks whose last key was replaced
+     * by a PMEM fill record. Outstanding readers keep their physical blocks. */
+    count = 0;
+    for(uint32_t i = 0; i < plan->old_count; i++){
+        uint32_t b = plan->old[i].addr.block;
+        if(!g_map[b] && !block_exist(b, blocks, count)) blocks[count++] = b;
+    }
+    reclaim_blocks(thread, blocks, count);
+    group->is_gc = false;
+    if(!plan->returned_tail) maintenance_request_flush(thread, group->boundary);
+    free(task->block_array);
+    free(plan);
+    task->gc_plan = NULL;
+    free_task(task);
+}
 
-        new_block = (uint32_t *)malloc(sizeof(uint32_t) * task->total_block_num);
-        if(new_block == NULL){
-            fprintf(stderr, "failed to allocate GC block array\n");
-            exit(EXIT_FAILURE);
-        }
-        memset(new_block, 0, sizeof(uint32_t) * task->total_block_num);
-        task->block_array_to_gc = task->block_array;
-        task->total_block_num_to_gc = task->total_block_num;
-        /*提交写任务*/
-        struct nvm_slot_update *slot_updates = NULL;
-        int slot_update_count = 0;
-        int blocks_to_write = fill_buffer_and_update_index(task->buffer,
-        (struct subspace_info *)task->subspace_info, (struct thread *)task->thread, task->block_array,
-         task->total_block_num, new_block, &slot_updates, &slot_update_count);
-        if(blocks_to_write <= 0){
-            fprintf(stderr, "GC failed while staging slot updates\n");
-            exit(EXIT_FAILURE);
-        }
-        task->gc_slot_updates = slot_updates;
-        task->gc_slot_update_count = slot_update_count;
-        task->total_block_num = blocks_to_write;
-        task->gc_io_failed = 0;
+static void garbadge_collection_cb_write_cb(void *arg, const struct spdk_nvme_cpl *cpl){
+    struct task *task = arg;
+    struct thread *thread = task->thread;
+    uint64_t start = spdk_get_ticks();
+    if(spdk_nvme_cpl_is_error(cpl)) task->gc_io_failed = 1;
+    if(++task->block_completed == task->total_block_num){
+        if(task->gc_io_failed) gc_fatal("SSD write completion failed");
+        gc_commit(task);
+    }
+    insert_breakdown[thread->thread].gc_cb_time += spdk_get_ticks() - start;
+}
+
+static void garbadge_collection_cb(void *arg, const struct spdk_nvme_cpl *cpl){
+    struct task *task = arg;
+    struct thread *thread = task->thread;
+    struct ns_entry *ns = thread->ns_entry;
+    uint64_t start = spdk_get_ticks();
+    if(spdk_nvme_cpl_is_error(cpl)) task->gc_io_failed = 1;
+    if(++task->block_completed == task->total_block_num){
+        if(task->gc_io_failed) gc_fatal("SSD read completion failed");
+        struct gc_plan *plan = gc_stage(task);
+        task->gc_plan = plan;
+        task->total_block_num = plan->write_count;
         task->block_completed = 0;
-        /*new_subspace*/
-        for(int i = 0 ; i < task->total_block_num ; i++){
-            thread_block_rw[thread->thread] ++;
+        if(!plan->write_count) gc_commit(task);
+        else for(uint32_t i = 0; i < plan->write_count; i++){
+            thread_block_rw[thread->thread]++;
             thread_gc_block_rw[thread->thread]++;
             thread_gc_block_write[thread->thread]++;
-            rc = spdk_nvme_ns_cmd_write(ns_entry->ns, ns_entry->qpair[qpair_num], (task->buffer + i * BLOCK_SIZE),
-                new_block[i] * physical_block_to_logical_block  ,1 * physical_block_to_logical_block , garbadge_collection_cb_write_cb , task , 0);
-            if (rc != 0) {
-                fprintf(stderr, "ERROR: starting GC write I/O failed; slots were not committed\n");
-                exit(EXIT_FAILURE);
-            }
+            if(spdk_nvme_ns_cmd_write(ns->ns, ns->qpair[thread->thread % ctr_max_qp],
+                task->buffer + (size_t)i * BLOCK_SIZE,
+                (uint64_t)plan->destinations[i] * physical_block_to_logical_block,
+                physical_block_to_logical_block, garbadge_collection_cb_write_cb, task,
+                SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS)) gc_fatal("SSD write submission failed");
         }
-
-        free(new_block);
-
     }
-    end_time = spdk_get_ticks();
-    insert_breakdown[thread->thread].gc_cb_time += end_time - start_time;
-    return ;
+    insert_breakdown[thread->thread].gc_cb_time += spdk_get_ticks() - start;
 }
 
-
 static uint32_t * block_redundant_compute_fraction(struct subspace_info * subspace_info , int * array_size ,struct thread * thread, double fraction){
-    struct redundant_element * redundant_array = (struct redundant_element *)malloc
-    (sizeof(struct redundant_element) * subspace_info->total_block_num);
-    memset(redundant_array , 0 , sizeof(struct redundant_element) * subspace_info->total_block_num);
+    struct redundant_element *redundant_array = calloc(GC_MAX_ENTRIES, sizeof(*redundant_array));
+    if(!redundant_array) gc_fatal("cannot allocate GC candidates");
     int size = 0;
     int j = 0;
     access_nvm();
@@ -315,10 +359,11 @@ static uint32_t * block_redundant_compute_fraction(struct subspace_info * subspa
         // 这里 invalid_block_num 就是“索引中完全看不到”的块数量
     }
 
-    qsort(redundant_array, subspace_info->total_block_num, sizeof(struct redundant_element), __redundant_comp);
-    uint32_t * arr = (uint32_t *)malloc(sizeof(uint32_t) * subspace_info->total_block_num);
+    qsort(redundant_array, size, sizeof(struct redundant_element), __redundant_comp);
+    uint32_t *arr = malloc(sizeof(*arr) * (size ? size : 1));
+    if(!arr) gc_fatal("cannot allocate GC selection");
     subspace_info->redundant_size = 0;
-    for (int i = 0; i < subspace_info->total_block_num; i++) {
+    for (int i = 0; i < size; i++) {
         if(redundant_array[i].block_redundant_size >= BLOCK_SIZE * fraction){//被选中gc
             arr[j] = redundant_array[i].block;
             j++;
@@ -369,9 +414,9 @@ void garbadge_collection_with_fraction(struct subspace_info * subspace_info ,str
     task->subspace_info = subspace_info;
     task->thread = thread;
     task->block_completed = 0;
-    task->gc_slot_updates = NULL;
-    task->gc_slot_update_count = 0;
+    task->gc_plan = NULL;
     task->gc_io_failed = 0;
+    if(redundant_array_size > LIBDB_TASK_BUFFER_BLOCK_COUNT) gc_fatal("selection exceeds DMA buffer");
     task->total_block_num = redundant_array_size;
     task->block_array = redundant_array;
     /*选择冗余度最高的部分块*/

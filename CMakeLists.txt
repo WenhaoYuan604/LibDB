@@ -136,6 +136,24 @@ if(BUILD_TESTING)
         target_compile_options(merge_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
         target_link_options(merge_test PRIVATE -fsanitize=address,undefined)
     endif()
+    # Same GC/IO harness with the real WBF allocator, small file quota and recovery.
+    add_executable(gc_tail_wbf_test tests/gc_tail_wbf_test.c space_stats.c dram_index.c subspace.c
+        write_buffer_index.c kvcache.c nvm_index.c merge_flush.c task.c get.c
+        scan.c insert.c index.c garbadge_c.c leaf_node_file.c recovery.c kvbuffer.c config.c)
+    target_include_directories(gc_tail_wbf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(gc_tail_wbf_test PRIVATE LIBDB_WBF_FILE_SIZE=16777216
+        LIBDB_WBF_CAPACITY_LIMIT_BYTES=33554432 LIBDB_NVM_FLUSH_HIGH_BYTES=29360128 LIBDB_NVM_FLUSH_LOW_BYTES=25165824)
+    target_compile_options(gc_tail_wbf_test PRIVATE -fcommon -ffunction-sections -fdata-sections -UNDEBUG)
+    target_link_options(gc_tail_wbf_test PRIVATE -Wl,--gc-sections
+        -Wl,--wrap=nvm_index_get_free_node -Wl,--wrap=nvm_index_reserve_free_nodes
+        -Wl,--wrap=nvm_index_commit_slot_updates)
+    target_link_libraries(gc_tail_wbf_test PRIVATE pmemobj pmem pthread m)
+    if(LIBDB_TEST_SANITIZERS)
+        target_compile_options(gc_tail_wbf_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(gc_tail_wbf_test PRIVATE -fsanitize=address,undefined)
+    endif()
+    add_test(NAME gc_tail_wbf COMMAND gc_tail_wbf_test)
+    set_tests_properties(gc_tail_wbf PROPERTIES TIMEOUT 90)
     add_executable(gc_poll_test tests/gc_poll_test.c space_stats.c)
     target_include_directories(gc_poll_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_options(gc_poll_test PRIVATE -fcommon -ffunction-sections -fdata-sections -UNDEBUG)

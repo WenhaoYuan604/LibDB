@@ -36,6 +36,7 @@ static struct result *last_result;
 static int commits, reclaimed, writes_completed, queued_count, pending_writes;
 static bool fail_read, fail_write, fail_commit, fail_submit, fail_alloc;
 static bool migration_test;
+static bool fail_wbf, fail_slot_alloc;
 static size_t stored_record_size = RECORD_SIZE;
 static int failure_exit_fd = -1;
 struct io {
@@ -122,6 +123,7 @@ void free_block(uint32_t *blocks, int count, struct segment **segment, struct fr
     }
 }
 PMEMoid __wrap_nvm_index_get_free_node(struct nvm_index *index, struct nvm_index_free_node **head, PMEMobjpool **out){
+    if(fail_slot_alloc) return OID_NULL;
     CHECK(slot_cursor < LNS_SIZE / LNF_SLOT_MIN_SIZE);
     PMEMoid oid = slot_segment;
     oid.off += slot_cursor++ * LNF_SLOT_MIN_SIZE;
@@ -149,6 +151,7 @@ int __wrap_nvm_index_commit_slot_updates(struct nvm_index *index, const struct n
     commits++;
     return rc;
 }
+#ifndef LIBDB_TEST_REAL_WBF
 /* PMEM record invalidation matches the production write-buffer contract. */
 int write_buffer_free(struct write_buffer *buffer, PMEMoid id, uint16_t seq, int size, struct write_buffer_free_node **head){
     uint16_t *key_size = pmemobj_direct(id);
@@ -164,6 +167,7 @@ int write_buffer_free(struct write_buffer *buffer, PMEMoid id, uint16_t seq, int
 PMEMoid write_buffer_insert(key_type key, kv_version_type version, const char *value,
     int value_size, struct write_buffer *buffer, uint16_t *seq,
     struct write_buffer_free_node **head, int thread){
+    if(fail_wbf) return OID_NULL;
     PMEMoid oid;
     CHECK(pmemobj_zalloc(pool, &oid, kv_record_size(value_size), 2) == 0);
     CHECK(kv_record_encode(pmemobj_direct(oid), kv_record_size(value_size), key, version, value, value_size) == 0);
@@ -173,6 +177,7 @@ PMEMoid write_buffer_insert(key_type key, kv_version_type version, const char *v
     *seq = 0;
     return oid;
 }
+#endif
 kv_version_type kv_record_next_thread_version(kv_version_type *next, kv_version_type *limit){ return ++*next; }
 
 static void setup(const char *path){
@@ -187,11 +192,18 @@ static void setup(const char *path){
     pmemobj_persist(pool, root, sizeof(*root));
     persistent.file_num = 1;
     persistent.pool[0] = pool;
-    database.write_buffer = worker.kvbuffer = &test_wbf;
+#ifdef LIBDB_TEST_REAL_WBF
+    struct write_buffer *real = write_buffer_initialize();
+    CHECK(real);
+    test_wbf = *real;
+    free(real);
+#else
     atomic_init(&test_wbf.used_slot_bytes, 0);
     test_wbf.file_bytes = test_wbf.file_peak_bytes = 32 * 1024 * 1024;
     atomic_init(&test_wbf.reusable_slot_bytes, test_wbf.file_bytes);
     CHECK(pthread_mutex_init(&g_mutex_lock_wbs, NULL) == 0);
+#endif
+    database.write_buffer = worker.kvbuffer = &test_wbf;
     space_stats_nvm_init(&database);
     database.thread = 1;
     database.boundary_size = 2;
@@ -246,15 +258,13 @@ static struct subspace_info *group(key_type fence){
     return g;
 }
 static void buffer_put(struct subspace_info *g, key_type key, char byte, size_t size){
-    PMEMoid oid;
-    CHECK(pmemobj_zalloc(pool, &oid, size, 2) == 0);
     char value[BLOCK_SIZE]; memset(value, byte, sizeof(value));
-    CHECK(kv_record_encode(pmemobj_direct(oid), size, key, key + byte, value, size - KV_RECORD_HEADER_SIZE) == 0);
-    pmemobj_persist(pool, pmemobj_direct(oid), size);
-    atomic_fetch_add(&test_wbf.used_slot_bytes, slot_bytes(size));
-    atomic_fetch_sub(&test_wbf.reusable_slot_bytes, slot_bytes(size));
-    struct write_buffer_return_type old = nvm_index_insert(g, oid, key, size, 0, 0);
-    if(old.size) write_buffer_free(worker.kvbuffer, old.id, 0, old.size, NULL);
+    uint16_t seq;
+    PMEMoid oid = write_buffer_insert(key, key + byte, value, size - KV_RECORD_HEADER_SIZE,
+        &test_wbf, &seq, &worker.buffer_free_head, 0);
+    CHECK(!OID_IS_NULL(oid));
+    struct write_buffer_return_type old = nvm_index_insert(g, oid, key, size, seq, 0);
+    if(old.size) write_buffer_free(worker.kvbuffer, old.id, old.WBF_seq, old.size, &worker.buffer_free_head);
 }
 static void buffered(struct subspace_info *g, key_type first, int count){
     for(int i = 0; i < count; i++) buffer_put(g, first + i, 'a', RECORD_SIZE);
@@ -790,9 +800,283 @@ static void wide_buffer_test(void){
     maintenance_clear_deferred(&worker);
 }
 
+/* Finish only GC reads, leaving every new SSD write pending. */
+static void gc_stage_test(struct subspace_info *g){
+    g->is_gc = true;
+    garbadge_collection_with_fraction(g, &worker, 0.0);
+    CHECK(queued_count);
+    while(queued_count && !queued[0].write) complete_at(0);
+    CHECK(g->is_gc && pending_writes && commits == 0 && reclaimed == 0);
+    for(int i = 0; i < queued_count; i++) CHECK(queued[i].flags & SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS);
+}
+static void gc_check_layout(struct subspace_info *g){
+    uint64_t bytes = 0;
+    key_type last = 0;
+    uint32_t keys = 0, blocks[(SUBSPACE_MAX_SLOT * SLOT_MAX_ELEMENT)], count = 0;
+    for(uint32_t i = 0; i < g->slot_num; i++){
+        CHECK(g->slot_key_num[i] && g->min_key[i] == subspace_slot_elements(g, i)[0].key);
+        CHECK(subspace_slot_boundary(g, i) == g->boundary);
+        for(uint32_t j = 0; j < g->slot_key_num[i]; j++){
+            struct slot_element e = subspace_slot_elements(g, i)[j];
+            CHECK(!keys || e.key > last); last = e.key; keys++;
+            CHECK(e.addr.off + e.addr.size <= BLOCK_SIZE && allocated[e.addr.block]);
+            struct kv_record_view view;
+            CHECK(!kv_record_decode_for_key(disk[e.addr.block] + e.addr.off, e.addr.size, e.key, &view));
+            if(!block_exist(e.addr.block, blocks, count)) blocks[count++] = e.addr.block;
+            bytes += e.addr.size;
+        }
+    }
+    CHECK(keys == g->key_num && count == g->total_block_num);
+    CHECK(g->redundant_size == (uint64_t)count * BLOCK_SIZE - bytes);
+    for(uint32_t i = 0; i < count; i++){
+        unsigned refs = 0;
+        for(uint32_t s = 0; s < g->slot_num; s++)
+            for(uint32_t j = 0; j < g->slot_key_num[s]; j++)
+                refs += subspace_slot_elements(g, s)[j].addr.block == blocks[i];
+        CHECK(g_map[blocks[i]] == refs);
+    }
+}
+static void gc_tail_return_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 1024; stored(a, 1, 6, 1);
+    PMEMoid retired = a->slot[5];
+    /* Pressure does not veto return, and a stale block-count estimate must not
+     * introduce zero/uninitialized candidates. */
+    a->total_block_num += 3;
+    atomic_store(&test_wbf.pressure, true);
+    gc_stage_test(a);
+    CHECK(pending_writes == 1 && a->buffered_size == 2048);
+    CHECK(a->key_num == 6 && nvm_index_search(a, 5).size == 1024);
+    CHECK(!worker.maintenance && !worker.deferred_flush);
+    CHECK(atomic_load(&test_wbf.used_slot_bytes) == 2048);
+    struct write_buffer_index_node *n = write_buffer_index_search(a->buffer_index, 5);
+    struct kv_record_view v;
+    CHECK(n && !kv_record_decode(pmemobj_direct(n->id), n->size, &v));
+    CHECK(v.version == 5 && v.value_size == 1024 - KV_RECORD_HEADER_SIZE);
+    check_get(5, 'a');
+    buffer_put(a, 6, 'c', 1024); /* overwrite while GC SSD write is pending */
+    drain();
+    CHECK(a->key_num == 4 && a->slot_num == 1 && a->total_block_num == 1);
+    CHECK(!((struct nvm_index_slot *)pmemobj_direct(retired))->entries[0].addr.size);
+    CHECK(!nvm_index_search(a, 5).size && !a->is_gc && reclaimed == 6);
+    CHECK(!worker.maintenance && !worker.deferred_flush);
+    maintenance_poll(&worker); CHECK(!queued_count);
+    check_get(5, 'a'); check_get(6, 'c'); gc_check_layout(a);
+}
+static void gc_tail_fill_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 1024; stored(a, 1, 6, 6);
+    buffer_put(a, 1, 'b', 1024); buffer_put(a, 100, 'c', 1024);
+    PMEMoid frozen = write_buffer_index_search(a->buffer_index, 1)->id;
+    char value[1024]; memset(value, 'a', sizeof(value));
+    kvcache_insert(a->kvcache, worker.lru_list, 1, value, sizeof(value), 0);
+    gc_stage_test(a);
+    CHECK(pending_writes == 2 && a->buffered_size == 0 && a->buffer_index->next);
+    CHECK(atomic_load(&test_wbf.used_slot_bytes) == 2048);
+    check_get(1, 'b'); check_get(100, 'c');
+    buffer_put(a, 1, 'd', 1024);
+    complete_at(1); /* out-of-order write completion must not free prefix */
+    CHECK(atomic_load(&test_wbf.used_slot_bytes) == 3072 && *(uint16_t *)pmemobj_direct(frozen));
+    drain();
+    CHECK(a->key_num == 7 && a->total_block_num == 2 && !a->buffer_index->next);
+    CHECK(atomic_load(&test_wbf.used_slot_bytes) == 1024 && !*(uint16_t *)pmemobj_direct(frozen));
+    check_get(1, 'd'); check_get(100, 'c'); gc_check_layout(a);
+}
+static void gc_tail_prefix_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 1024; stored(a, 1, 6, 6);
+    buffer_put(a, 100, 'b', 1024); buffer_put(a, 101, 'c', 1536);
+    buffer_put(a, 102, 'd', 1024); /* would fit if the oversized key were skipped */
+    PMEMoid first = write_buffer_index_search(a->buffer_index, 100)->id;
+    gc_stage_test(a); drain();
+    CHECK(a->key_num == 4 && a->buffered_size == 5632 && !a->buffer_index->next);
+    CHECK(OID_EQUALS(first, write_buffer_index_search(a->buffer_index, 100)->id));
+    for(int i = 100; i <= 102; i++) check_get(i, 'b' + i - 100);
+    gc_check_layout(a);
+}
+static void gc_tail_insufficient_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 1024; stored(a, 1, 6, 6);
+    buffer_put(a, 100, 'b', 1024);
+    gc_stage_test(a); drain();
+    CHECK(a->buffered_size == 3072 && a->key_num == 4);
+    check_get(100, 'b'); gc_check_layout(a);
+}
+static void gc_tail_versions_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 1024; stored(a, 1, 6, 6);
+    a->is_gc = true; garbadge_collection_with_fraction(a, &worker, 0.0);
+    buffer_put(a, 5, 'b', 3072); /* newer active value; too large to fill */
+    PMEMoid id = write_buffer_index_search(a->buffer_index, 5)->id;
+    drain();
+    CHECK(OID_EQUALS(id, write_buffer_index_search(a->buffer_index, 5)->id));
+    CHECK(atomic_load(&test_wbf.used_slot_bytes) == 5120);
+    CHECK(a->buffered_size == 4096 && a->key_num == 4);
+    check_get(5, 'b'); check_get(6, 'a'); gc_check_layout(a);
+}
+static void gc_tail_equal_older_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 1024; stored(a, 1, 6, 6);
+    buffer_put(a, 5, 'a', 3072); buffer_put(a, 6, 'b', 1024);
+    struct write_buffer_index_node *five = write_buffer_index_search(a->buffer_index, 5);
+    struct write_buffer_index_node *six = write_buffer_index_search(a->buffer_index, 6);
+    ((struct kv_pmem_record *)pmemobj_direct(five->id))->version = 5;
+    ((struct kv_pmem_record *)pmemobj_direct(six->id))->version = 1;
+    PMEMoid equal = five->id, older = six->id;
+    gc_stage_test(a); drain();
+    CHECK(OID_EQUALS(equal, write_buffer_index_search(a->buffer_index, 5)->id));
+    CHECK(!OID_EQUALS(older, write_buffer_index_search(a->buffer_index, 6)->id));
+    CHECK(!*(uint16_t *)pmemobj_direct(older));
+    check_get(5, 'a'); check_get(6, 'a'); gc_check_layout(a);
+}
+static void gc_tail_capacity_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 64; stored(a, 1, 127, SLOT_MAX_ELEMENT);
+    buffer_put(a, 1000, 'b', 64); buffer_put(a, 1001, 'c', 64);
+    stored_record_size = 4032; stored(a, 2000, 1, 1);
+    /* Packed tail has 64 bytes free. Adding a new SSD key exceeds 128. */
+    gc_stage_test(a); drain();
+    CHECK(a->key_num == 127 && a->buffered_size == 4160);
+    CHECK(write_buffer_index_search(a->buffer_index, 1000));
+    CHECK(!nvm_index_search(a, 2000).size); check_get(2000, 'a'); gc_check_layout(a);
+}
+static void gc_tail_prune_output_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 3000; stored(a, 1, 2, 2);
+    buffer_put(a, 1, 'b', 1096);
+    gc_stage_test(a); CHECK(pending_writes == 1); drain();
+    CHECK(a->total_block_num == 1 && a->redundant_size == 0 && a->key_num == 2);
+    check_get(1, 'b'); check_get(2, 'a'); gc_check_layout(a);
+}
+static void gc_tail_unselected_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 4096; stored(a, 1, 1, 1);
+    uint32_t unselected = nvm_index_search(a, 1).block;
+    stored_record_size = 1024; stored(a, 2, 6, 6);
+    buffer_put(a, 1, 'b', 2048);
+    a->is_gc = true; garbadge_collection_with_fraction(a, &worker, 0.5);
+    CHECK(queued_count == 6); drain();
+    CHECK(!allocated[unselected] && reclaimed == 7);
+    CHECK(a->key_num == 7 && a->total_block_num == 2);
+    check_get(1, 'b'); gc_check_layout(a);
+}
+static void gc_tail_full_single_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 1024; stored(a, 1, 8, 8);
+    buffer_put(a, 100, 'b', 1024);
+    gc_stage_test(a); drain();
+    CHECK(a->buffered_size == 1024 && a->key_num == 8 && a->total_block_num == 2);
+    struct subspace_info *b = group(1000);
+    stored(b, 1001, 2, 2);
+    b->is_gc = true; garbadge_collection_with_fraction(b, &worker, 0.0); drain();
+    CHECK(!b->buffered_size && b->key_num == 2 && b->total_block_num == 1);
+    gc_check_layout(a); gc_check_layout(b);
+}
+static void gc_tail_no_flush_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 1024; stored(a, 1, 6, 6);
+    for(int k = 100; k < 105; k++) buffer_put(a, k, 'b', BLOCK_SIZE);
+    gc_stage_test(a); drain();
+    CHECK(a->buffered_size > BLOCK_SIZE * Flush_Blcok_Num);
+    CHECK(!worker.maintenance && !worker.deferred_flush);
+    space_stats_nvm_start_at(&database, 0);
+    atomic_store(&test_wbf.pressure, true);
+    maintenance_poll(&worker); CHECK(!queued_count);
+    space_stats_nvm_stop(&database); maintenance_poll(&worker);
+    CHECK(!queued_count && !worker.maintenance && !worker.deferred_flush);
+}
+static void gc_tail_grow_slots_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 1024; stored(a, 1, SLOT_MAX_ELEMENT, SLOT_MAX_ELEMENT);
+    buffer_put(a, 100, 'b', BLOCK_SIZE - (SLOT_MAX_ELEMENT % 4) * 1024);
+    gc_stage_test(a); drain();
+    CHECK(a->slot_num == 2 && a->key_num == SLOT_MAX_ELEMENT + 1);
+    CHECK(!atomic_load(&test_wbf.used_slot_bytes));
+    check_get(100, 'b'); gc_check_layout(a);
+}
+static void gc_tail_pending_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 1024; stored(a, 1, 6, 6);
+    for(int k = 100; k < 105; k++) buffer_put(a, k, 'b', BLOCK_SIZE);
+    maintenance_request_flush(&worker, a->boundary);
+    void *pending = worker.maintenance;
+    CHECK(pending);
+    gc_stage_test(a); drain();
+    CHECK(worker.maintenance == pending && !a->is_gc);
+    maintenance_poll(&worker); CHECK(queued_count); drain();
+    check_get(5, 'a'); check_get(104, 'b');
+}
+static void gc_tail_read_scan_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 1024; stored(a, 1, 6, 6);
+    uint32_t pinned = nvm_index_search(a, 5).block;
+    key_type keys[6]; char *values[6] = {0}; int sizes[6];
+    struct scan_kv result = {6, keys, values, sizes};
+    CHECK(scan(1, 6, (char *)&result, &worker, 0) == 0);
+    int reads = queued_count;
+    a->is_gc = true; garbadge_collection_with_fraction(a, &worker, 0.0);
+    while(queued_count > reads) complete_at(queued_count - 1);
+    CHECK(!a->is_gc && allocated[pinned] && worker.read_pins);
+    drain(); CHECK(last_result && last_result->size == 6 && !allocated[pinned]);
+    for(int i = 0; i < 6; i++){ CHECK(keys[i] == i + 1 && values[i][0] == 'a'); free(values[i]); }
+    free(last_result); last_result = NULL;
+    CHECK(!worker.read_pins && !a->read_refs);
+    memset(values, 0, sizeof(values));
+    CHECK(scan(1, 6, (char *)&result, &worker, 0) == 0); drain();
+    CHECK(last_result && last_result->size == 6);
+    for(int i = 0; i < 6; i++){ CHECK(keys[i] == i + 1 && values[i][0] == 'a'); free(values[i]); }
+    free(last_result); last_result = NULL; gc_check_layout(a);
+}
+static void gc_failure_exit_check(void){
+    struct subspace_info *a = dram_index_search(hybrid.dram_index, 0, NULL, NULL);
+    char ok = a->is_gc && reclaimed == 0 && commits == 0 && a->key_num >= 6;
+    CHECK(write(failure_exit_fd, &ok, 1) == 1);
+}
+static void gc_tail_failure_test(void){
+    struct subspace_info *a = group(0);
+    stored_record_size = 1024; stored(a, 1, 6, 6);
+    for(int kind = 0; kind < 7; kind++){
+        int pipes[2]; CHECK(!pipe(pipes));
+        pid_t pid = fork(); CHECK(pid >= 0);
+        if(!pid){
+            close(pipes[0]); failure_exit_fd = pipes[1]; atexit(gc_failure_exit_check);
+            if(kind == 0) fail_read = true;
+            if(kind == 1) fail_write = true;
+            if(kind == 2) fail_commit = true;
+            if(kind == 3) fail_submit = true;
+            if(kind == 4) fail_wbf = true;
+            if(kind == 5) fail_space_at = next_block;
+            if(kind == 6){
+                /* Fill grows a full slot by one, forcing slot allocation. */
+                stored_record_size = 1024; stored(a, 7, SLOT_MAX_ELEMENT - 6, SLOT_MAX_ELEMENT - 6);
+                buffer_put(a, 100, 'b', BLOCK_SIZE - (SLOT_MAX_ELEMENT % 4) * 1024);
+                fail_slot_alloc = true;
+                /* Keep the same key count but one fully occupied source slot. */
+                struct slot_element all[SLOT_MAX_ELEMENT];
+                int n = 0;
+                for(unsigned i = 0; i < a->slot_num; i++)
+                    for(unsigned j = 0; j < a->slot_key_num[i]; j++) all[n++] = subspace_slot_elements(a, i)[j];
+                memcpy(subspace_slot_elements(a, 0), all, sizeof(all));
+                a->slot_num = 1; a->slot_key_num[0] = SLOT_MAX_ELEMENT;
+            }
+            a->is_gc = true; garbadge_collection_with_fraction(a, &worker, 0.0); drain(); _exit(42);
+        }
+        close(pipes[1]); char ok = 0; CHECK(read(pipes[0], &ok, 1) == 1 && ok); close(pipes[0]);
+        int status; CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == EXIT_FAILURE);
+    }
+}
+
 struct test_case { const char *name; void (*fn)(void); };
 int main(void){
     struct test_case cases[] = {
+        {"gc-tail-return", gc_tail_return_test}, {"gc-tail-fill", gc_tail_fill_test},
+        {"gc-tail-prefix", gc_tail_prefix_test}, {"gc-tail-insufficient", gc_tail_insufficient_test},
+        {"gc-tail-versions", gc_tail_versions_test}, {"gc-tail-equal-older", gc_tail_equal_older_test},
+        {"gc-tail-capacity", gc_tail_capacity_test}, {"gc-tail-prune", gc_tail_prune_output_test},
+        {"gc-tail-unselected", gc_tail_unselected_test}, {"gc-tail-full-single", gc_tail_full_single_test},
+        {"gc-tail-no-flush", gc_tail_no_flush_test}, {"gc-tail-grow-slots", gc_tail_grow_slots_test},
+        {"gc-tail-pending", gc_tail_pending_test}, {"gc-tail-read-scan", gc_tail_read_scan_test},
+        {"gc-tail-failures", gc_tail_failure_test},
         {"dynamic-cycle", dynamic_cycle_test}, {"dynamic-bounded", dynamic_bounded_test},
         {"dynamic-busy", dynamic_busy_test}, {"dynamic-merge", dynamic_merge_test},
         {"dynamic-split", dynamic_split_test}, {"wide-buffer", wide_buffer_test},

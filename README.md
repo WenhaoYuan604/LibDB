@@ -1,6 +1,6 @@
 # LibDB
 
-当前版本：**0.2.0**。版本更新和兼容性说明见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本：**0.3.0**。版本更新和兼容性说明见 [CHANGELOG.md](CHANGELOG.md)。
 
 本仓库提供 LibDB 的可复现实验代码和脚本。下面只给出从编译到运行 YCSB A/C 与 recovery 的最短流程。
 
@@ -167,9 +167,9 @@ ctest --test-dir build --output-on-failure
 ```bash
 cmake -S . -B /tmp/libdb-merge-asan -DSPDK_ROOT="$SPDK_ROOT" \
   -DLIBDB_TEST_SANITIZERS=ON
-cmake --build /tmp/libdb-merge-asan --target merge_test allocator_test --parallel
+cmake --build /tmp/libdb-merge-asan --target merge_test gc_tail_wbf_test allocator_test --parallel
 ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
-  ctest --test-dir /tmp/libdb-merge-asan --output-on-failure
+  ctest --test-dir /tmp/libdb-merge-asan --output-on-failure -R '^(merge|gc_tail_wbf|allocator)$'
 ```
 
 测试以独立子进程隔离场景，覆盖阈值、重复键、空组、跨叶节点 fence 删除、cache/LRU、
@@ -179,6 +179,33 @@ ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
 ### 动态 GC 阈值
 
 初始 load 成功完成后，固定插入记录的 value 长度与记录头之和作为数据库大小（重复插入按输入计数）。main 线程立即采样并每 100ms 读取 SSD 被引用数据块的原子计数；空间放大为被引用块字节数除以初始 load 大小，不计 PMEM、缓存或无引用预分配块，也不强制刷盘。空间放大 ≤1.30 时，冗余阈值放宽为 0.55，对应垃圾占用比例阈值 0.55/1.55；否则使用 0.30，对应比例 0.30/1.30；GC 触发与块筛选使用同一次阈值快照。首次采样及阈值切换不输出日志。load 前、统计无效及跳过 load 的恢复模式保持 0.3/1.3。
+
+### GC 尾块补齐与回迁
+
+GC 整理 SSD 有效记录后，如果输出有多个块且最后一块不足 4KiB，会按 key 升序尝试
+使用本组活动 PMEM 写缓冲的前缀补齐。只有记录恰好填满剩余空间，且最终 SSD 索引不超过
+key/slot 容量时才补齐；遇到下一条放不下的记录就停止，不跳过记录。补齐批次会冻结并保持
+可读，期间的新写入进入活动缓冲。单个不足 4KiB 的输出块以及完整尾块保持正常 SSD 写入。
+
+无法精确补齐时，候选缓冲记录保持不变，GC 把 SSD 尾块记录回迁 PMEM，少写一个 SSD 块。
+回迁保留原始版本、逻辑 value 长度和有效的 32 字节前缀，已有相同或更新的 PMEM 版本不会
+被覆盖。回迁沿用 WBF 分配、回收和空间计数接口：压力标志不禁止回迁，但仍遵守现有 16GiB
+文件容量硬上限；没有可用槽位且无法扩容时沿用失败终止策略。回迁过程和该分支的完成回调
+不新增 Flush 请求，原先已登记的维护或延后 Flush 请求仍可在 GC 完成后执行。
+
+目标 SSD 块使用 FUA 写入；全部写入完成后提交索引槽位，再更新内存元数据、清理旧缓存、
+回收冻结记录和无引用源块。尚未完成的读取会推迟物理块复用。补齐按 key 合并映射，避免
+旧 SSD 地址与补齐记录重复；不再引用的输出块不会分配或写入。持久化记录格式不变，
+沿用现有逐槽位提交及恢复协议，不提供跨槽位的原子提交保证。
+
+`merge` 测试包含尾块分支、覆盖写、延迟 get/scan、计数、维护队列及故障注入；
+`gc_tail_wbf` 使用模拟 NVMe 和真实临时 PMDK/WBF 文件，覆盖补齐、回迁、重启恢复及小预算
+硬上限耗尽。两者均不访问真实 SSD，可单独运行：
+
+```bash
+cmake --build build --target merge_test gc_tail_wbf_test --parallel
+ctest --test-dir build --output-on-failure -R '^(merge|gc_tail_wbf)$'
+```
 
 ### Uniform / Zipfian YCSB A、F 测试
 

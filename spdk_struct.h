@@ -75,8 +75,7 @@ struct task{
 	uint32_t * block_array_to_gc;
 	int total_block_num_to_gc;
 	int flush_io_failed;
-	void * gc_slot_updates;
-	int gc_slot_update_count;
+	void * gc_plan;
 	int gc_io_failed;
 	void * split_plan;
 	int split_io_failed;

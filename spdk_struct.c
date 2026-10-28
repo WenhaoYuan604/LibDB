@@ -283,8 +283,7 @@ struct ns_entry * initialize_nvmessd(int qpair_num, int qpair_size,
 				printf("ERROR:failed to alloc memory for ns_entry->task_array[i][k].buffer\n");
 			}
 			ns_entry->task_array[i][k].ns_entry = ns_entry;
-				ns_entry->task_array[i][k].gc_slot_updates = NULL;
-				ns_entry->task_array[i][k].gc_slot_update_count = 0;
+				ns_entry->task_array[i][k].gc_plan = NULL;
 				ns_entry->task_array[i][k].flush_io_failed = 0;
 				ns_entry->task_array[i][k].gc_io_failed = 0;
 			ns_entry->task_array[i][k].split_plan = NULL;
