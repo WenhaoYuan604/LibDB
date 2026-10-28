@@ -46,17 +46,24 @@ static struct redundant_element * redundant_element_find(uint32_t block,
 
 
 /* Private, volatile GC state. Persistent slots remain unchanged until every
- * destination is durable. A packed block number is only a staging ordinal. */
+ * destination write has completed. A packed block number is a staging ordinal. */
 #define GC_MAX_ENTRIES (SUBSPACE_MAX_SLOT * SLOT_MAX_ELEMENT)
 struct gc_entry {
     struct slot_element item;
     int packed_block;
+    uint32_t source_slot;
 };
 struct gc_plan {
+    /* Only old mappings displaced by this GC, each recorded once. */
     struct slot_element old[GC_MAX_ENTRIES];
     struct gc_entry entries[GC_MAX_ENTRIES];
     uint32_t old_count, count, slot_count, update_count;
-    struct nvm_slot_update updates[SUBSPACE_MAX_SLOT];
+    struct nvm_slot_update updates[2 * SUBSPACE_MAX_SLOT];
+    bool dirty[SUBSPACE_MAX_SLOT];
+    PMEMoid slots[SUBSPACE_MAX_SLOT], retired[SUBSPACE_MAX_SLOT];
+    uint8_t slot_keys[SUBSPACE_MAX_SLOT];
+    key_type min_keys[SUBSPACE_MAX_SLOT];
+    uint32_t retired_count;
     struct write_buffer_index *frozen;
     bool returned_tail;
     uint32_t destinations[LIBDB_TASK_BUFFER_BLOCK_COUNT];
@@ -68,10 +75,11 @@ static void gc_fatal(const char *reason){
     exit(EXIT_FAILURE);
 }
 
-static int gc_entry_compare(const void *a, const void *b){
-    key_type x = ((const struct gc_entry *)a)->item.key;
-    key_type y = ((const struct gc_entry *)b)->item.key;
-    return (x > y) - (x < y);
+/* Route against the existing slot fences, just like normal index insertion. */
+static uint32_t gc_key_slot(const struct subspace_info *group, key_type key){
+    uint32_t slot = 0;
+    while(slot + 1 < group->slot_num && key >= group->min_key[slot + 1]) slot++;
+    return slot;
 }
 
 /* Validate the entire prefix before detaching anything. Never skip an oversized
@@ -79,6 +87,8 @@ static int gc_entry_compare(const void *a, const void *b){
 static size_t gc_fill_prefix_count(struct gc_plan *plan,
                                   struct subspace_info *group, size_t needed){
     size_t bytes = 0, keys = 0, projected = plan->count;
+    uint32_t slot_keys[SUBSPACE_MAX_SLOT];
+    for(uint32_t i = 0; i < group->slot_num; i++) slot_keys[i] = group->slot_key_num[i];
     for(struct write_buffer_index_node *n = group->buffer_index->head->forward[0];
         n && bytes < needed; n = n->forward[0]){
         if(n->size > needed - bytes) return 0;
@@ -88,12 +98,18 @@ static size_t gc_fill_prefix_count(struct gc_plan *plan,
         bool exists = false;
         for(uint32_t i = 0; i < plan->count; i++)
             if(plan->entries[i].item.key == n->key) { exists = true; break; }
-        if(!exists) projected++;
+        if(!exists){
+            projected++;
+            slot_keys[gc_key_slot(group, n->key)]++;
+        }
         if(projected > SUBSPACE_MAX_KEY || projected > GC_MAX_ENTRIES) return 0;
         bytes += n->size;
         keys++;
     }
-    return bytes == needed ? keys : 0;
+    uint32_t slots = 0;
+    for(uint32_t i = 0; i < group->slot_num; i++)
+        slots += (slot_keys[i] + SLOT_MAX_ELEMENT - 1) / SLOT_MAX_ELEMENT;
+    return bytes == needed && slots <= SUBSPACE_MAX_SLOT ? keys : 0;
 }
 
 static void gc_return_record(struct thread *thread, struct subspace_info *group,
@@ -121,11 +137,71 @@ static void gc_return_record(struct thread *thread, struct subspace_info *group,
                                   old.size, &thread->buffer_free_head);
 }
 
+/* Preserve every original slot unless its own records changed. Insertion
+ * splits only that slot, using the same balanced partition as the normal
+ * per-slot merge in nvm_index_insert_after_flush_body(). */
+static void gc_stage_slots(struct gc_plan *plan, struct subspace_info *group,
+                           struct thread *thread){
+    uint32_t counts[SUBSPACE_MAX_SLOT] = {0}, extra = 0;
+    for(uint32_t i = 0; i < plan->count; i++) counts[plan->entries[i].source_slot]++;
+    for(uint32_t i = 0; i < group->slot_num; i++)
+        if(counts[i]) extra += (counts[i] - 1) / SLOT_MAX_ELEMENT;
+    if(extra && !nvm_index_reserve_free_nodes(thread->index->nvm_index,
+                                             &thread->index_free_head, extra))
+        gc_fatal("cannot reserve output slots");
+    uint32_t at = 0;
+    for(uint32_t i = 0; i < group->slot_num; i++){
+        if(!plan->dirty[i]){
+            uint32_t out = plan->slot_count++;
+            plan->slots[out] = group->slot[i];
+            plan->slot_keys[out] = group->slot_key_num[i];
+            plan->min_keys[out] = group->min_key[i];
+            at += counts[i];
+            continue;
+        }
+        if(!counts[i]){
+            /* Only an emptied slot is retired; its neighbors stay separate. */
+            plan->updates[plan->update_count++].slot = group->slot[i];
+            plan->retired[plan->retired_count++] = group->slot[i];
+            continue;
+        }
+        uint32_t remaining = counts[i];
+        uint32_t parts = (remaining + SLOT_MAX_ELEMENT - 1) / SLOT_MAX_ELEMENT;
+        bool first = true;
+        while(parts){
+            if(plan->slot_count == SUBSPACE_MAX_SLOT) gc_fatal("output index exceeds slot capacity");
+            uint32_t n = remaining / parts;
+            PMEMobjpool *pool;
+            PMEMoid id = first ? group->slot[i] : nvm_index_get_free_node(
+                thread->index->nvm_index, &thread->index_free_head, &pool);
+            if(OID_IS_NULL(id)) gc_fatal("cannot allocate output slot");
+            struct nvm_slot_update *update = &plan->updates[plan->update_count++];
+            update->slot = id;
+            update->image.boundary = group->boundary;
+            for(uint32_t j = 0; j < n; j++){
+                if(at >= plan->count || plan->entries[at].source_slot != i)
+                    gc_fatal("invalid slot-local record order");
+                update->image.entries[j] = plan->entries[at++].item;
+            }
+            uint32_t out = plan->slot_count++;
+            plan->slots[out] = id;
+            plan->slot_keys[out] = n;
+            plan->min_keys[out] = update->image.entries[0].key;
+            remaining -= n;
+            parts--;
+            first = false;
+        }
+    }
+}
+
 static struct gc_plan *gc_stage(struct task *task){
     struct thread *thread = task->thread;
     struct subspace_info *group = task->subspace_info;
     struct gc_plan *plan = calloc(1, sizeof(*plan));
-    char *packed = calloc(LIBDB_TASK_BUFFER_BLOCK_COUNT, BLOCK_SIZE);
+    const size_t packed_blocks = task->total_block_num;
+    if(!packed_blocks || packed_blocks > LIBDB_TASK_BUFFER_BLOCK_COUNT)
+        gc_fatal("invalid staging block count");
+    char *packed = malloc(packed_blocks * BLOCK_SIZE);
     if(!plan || !packed) gc_fatal("cannot allocate staging buffers");
     int block = 0;
     size_t off = 0;
@@ -139,9 +215,11 @@ static struct gc_plan *gc_stage(struct task *task){
             struct gc_entry *e = &plan->entries[plan->count++];
             e->item = entries[j];
             e->packed_block = -1;
-            plan->old[plan->old_count++] = e->item;
+            e->source_slot = i;
             int source = block_exist(e->item.addr.block, task->block_array, task->total_block_num);
             if(!source) continue;
+            plan->old[plan->old_count++] = e->item;
+            plan->dirty[i] = true;
             struct kv_record_view view;
             size_t size = e->item.addr.size;
             if(size > BLOCK_SIZE || e->item.addr.off + size > BLOCK_SIZE)
@@ -149,8 +227,11 @@ static struct gc_plan *gc_stage(struct task *task){
             const char *record = task->buffer + (size_t)(source - 1) * BLOCK_SIZE + e->item.addr.off;
             if(kv_record_decode_for_key(record, size, e->item.key, &view) || view.record_size != size)
                 gc_fatal("invalid SSD record");
-            if(off + size > BLOCK_SIZE) { block++; off = 0; }
-            if(block >= LIBDB_TASK_BUFFER_BLOCK_COUNT) gc_fatal("packed output exceeds DMA buffer");
+            if(off + size > BLOCK_SIZE){
+                memset(packed + (size_t)block * BLOCK_SIZE + off, 0, BLOCK_SIZE - off);
+                block++; off = 0;
+            }
+            if((size_t)block >= packed_blocks) gc_fatal("packed output exceeds staging buffer");
             memcpy(packed + (size_t)block * BLOCK_SIZE + off, record, size);
             e->packed_block = block;
             e->item.addr.off = off;
@@ -170,9 +251,21 @@ static struct gc_plan *gc_stage(struct task *task){
             group->buffer_index->next = plan->frozen;
             for(struct write_buffer_index_node *n = plan->frozen->head->forward[0]; n; n = n->forward[0]){
                 uint32_t i = 0;
-                while(i < plan->count && plan->entries[i].item.key != n->key) i++;
-                if(i == plan->count) plan->count++;
+                while(i < plan->count && plan->entries[i].item.key < n->key) i++;
+                if(i == plan->count || plan->entries[i].item.key != n->key){
+                    memmove(plan->entries + i + 1, plan->entries + i,
+                            (plan->count - i) * sizeof(*plan->entries));
+                    plan->count++;
+                    plan->entries[i].source_slot = gc_key_slot(group, n->key);
+                } else if(plan->entries[i].packed_block < 0){
+                    /* Selected mappings were recorded before packing; a fill
+                     * can also replace a key in an unselected source block. */
+                    plan->old[plan->old_count++] = plan->entries[i].item;
+                }
+                if((size_t)block >= packed_blocks || n->size > BLOCK_SIZE - off)
+                    gc_fatal("PMEM fill exceeds staging buffer");
                 struct gc_entry *e = &plan->entries[i];
+                plan->dirty[e->source_slot] = true;
                 e->item = (struct slot_element){.key = n->key,
                     .addr = {.off = off, .size = n->size}};
                 e->packed_block = block;
@@ -195,6 +288,7 @@ static struct gc_plan *gc_stage(struct task *task){
         }
     }
     access_nvm_release();
+    memset(packed + (size_t)block * BLOCK_SIZE + off, 0, BLOCK_SIZE - off);
 
     /* Allocate only referenced outputs. A fill can supersede the last live
      * key in an earlier packed block, so even a non-tail block may disappear. */
@@ -212,24 +306,7 @@ static struct gc_plan *gc_stage(struct task *task){
             if(plan->entries[i].packed_block == b) plan->entries[i].item.addr.block = dest;
     }
     free(packed);
-    qsort(plan->entries, plan->count, sizeof(*plan->entries), gc_entry_compare);
-    plan->slot_count = (plan->count + SLOT_MAX_ELEMENT - 1) / SLOT_MAX_ELEMENT;
-    if(plan->slot_count > SUBSPACE_MAX_SLOT) gc_fatal("output index exceeds slot capacity");
-    plan->update_count = plan->slot_count > group->slot_num ? plan->slot_count : group->slot_num;
-    if(plan->slot_count > group->slot_num &&
-       !nvm_index_reserve_free_nodes(thread->index->nvm_index, &thread->index_free_head,
-                                    plan->slot_count - group->slot_num))
-        gc_fatal("cannot reserve output slots");
-    for(uint32_t i = 0; i < plan->update_count; i++){
-        PMEMobjpool *pool;
-        plan->updates[i].slot = i < group->slot_num ? group->slot[i] :
-            nvm_index_get_free_node(thread->index->nvm_index, &thread->index_free_head, &pool);
-        if(OID_IS_NULL(plan->updates[i].slot)) gc_fatal("cannot allocate output slot");
-        if(i >= plan->slot_count) continue; /* zero retired slot */
-        plan->updates[i].image.boundary = group->boundary;
-        for(uint32_t j = 0; j < SLOT_MAX_ELEMENT && i * SLOT_MAX_ELEMENT + j < plan->count; j++)
-            plan->updates[i].image.entries[j] = plan->entries[i * SLOT_MAX_ELEMENT + j].item;
-    }
+    gc_stage_slots(plan, group, thread);
     return plan;
 }
 
@@ -239,41 +316,43 @@ static void gc_commit(struct task *task){
     struct gc_plan *plan = task->gc_plan;
     if(nvm_index_commit_slot_updates(thread->index->nvm_index, plan->updates, plan->update_count))
         gc_fatal("slot commit failed");
-    for(uint32_t i = 0; i < plan->old_count; i++){
+    for(uint32_t i = 0; i < plan->old_count; i++)
         block_ref_remove(plan->old[i].addr.block);
-        kvcache_delete(group->kvcache, thread->lru_list, plan->old[i].key);
-    }
     uint32_t blocks[GC_MAX_ENTRIES], count = 0;
     uint64_t bytes = 0;
     for(uint32_t i = 0; i < plan->count; i++){
         struct slot_element *e = &plan->entries[i].item;
-        block_ref_add(e->addr.block);
+        if(plan->entries[i].packed_block >= 0) block_ref_add(e->addr.block);
         if(!block_exist(e->addr.block, blocks, count)) blocks[count++] = e->addr.block;
         bytes += e->addr.size;
-        kvcache_delete(group->kvcache, thread->lru_list, e->key);
     }
     group->total_block_num = count;
     group->redundant_size = (uint64_t)count * BLOCK_SIZE - bytes;
     group->key_num = plan->count;
+    uint32_t old_slots = group->slot_num;
+    for(uint32_t i = 0; i < plan->retired_count; i++)
+        nvm_index_recycle_slot(thread->index->nvm_index, &thread->index_free_head, plan->retired[i]);
     group->slot_num = plan->slot_count;
-    for(uint32_t i = 0; i < plan->update_count; i++){
-        if(i >= plan->slot_count){
-            nvm_index_recycle_slot(thread->index->nvm_index, &thread->index_free_head, plan->updates[i].slot);
-            group->slot[i] = OID_NULL;
-            group->slot_key_num[i] = 0;
-            group->min_key[i] = 0;
-            group->pool[i] = NULL;
-        } else {
-            group->slot[i] = plan->updates[i].slot;
-            group->pool[i] = pmemobj_pool_by_oid(group->slot[i]);
-            uint32_t remaining = plan->count - i * SLOT_MAX_ELEMENT;
-            group->slot_key_num[i] = remaining < SLOT_MAX_ELEMENT ? remaining : SLOT_MAX_ELEMENT;
-            group->min_key[i] = plan->updates[i].image.entries[0].key;
-        }
+    for(uint32_t i = 0; i < plan->slot_count; i++){
+        group->slot[i] = plan->slots[i];
+        group->pool[i] = pmemobj_pool_by_oid(plan->slots[i]);
+        group->slot_key_num[i] = plan->slot_keys[i];
+        group->min_key[i] = plan->min_keys[i];
+        group->need_persist[i] = false;
+    }
+    for(uint32_t i = plan->slot_count; i < old_slots; i++){
+        group->slot[i] = OID_NULL;
+        group->pool[i] = NULL;
+        group->slot_key_num[i] = 0;
+        group->min_key[i] = 0;
         group->need_persist[i] = false;
     }
     if(plan->frozen){
         struct write_buffer_index *batch = plan->frozen;
+        /* Only a fill can expose a different value when its frozen PMEM
+         * record disappears. Pure relocation keeps the existing value cache. */
+        for(struct write_buffer_index_node *n = batch->head->forward[0]; n; n = n->forward[0])
+            kvcache_delete(group->kvcache, thread->lru_list, n->key);
         batch->prev->next = batch->next;
         if(batch->next) batch->next->prev = batch->prev;
         for(struct write_buffer_index_node *n = batch->head->forward[0]; n; n = n->forward[0])
@@ -289,7 +368,6 @@ static void gc_commit(struct task *task){
     }
     reclaim_blocks(thread, blocks, count);
     group->is_gc = false;
-    if(!plan->returned_tail) maintenance_request_flush(thread, group->boundary);
     free(task->block_array);
     free(plan);
     task->gc_plan = NULL;
@@ -301,6 +379,7 @@ static void garbadge_collection_cb_write_cb(void *arg, const struct spdk_nvme_cp
     struct thread *thread = task->thread;
     uint64_t start = spdk_get_ticks();
     if(spdk_nvme_cpl_is_error(cpl)) task->gc_io_failed = 1;
+    else ssd_write_completed(&thread->ssd_writes, SSD_WRITE_GC, BLOCK_SIZE);
     if(++task->block_completed == task->total_block_num){
         if(task->gc_io_failed) gc_fatal("SSD write completion failed");
         gc_commit(task);
@@ -329,7 +408,7 @@ static void garbadge_collection_cb(void *arg, const struct spdk_nvme_cpl *cpl){
                 task->buffer + (size_t)i * BLOCK_SIZE,
                 (uint64_t)plan->destinations[i] * physical_block_to_logical_block,
                 physical_block_to_logical_block, garbadge_collection_cb_write_cb, task,
-                SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS)) gc_fatal("SSD write submission failed");
+                0)) gc_fatal("SSD write submission failed");
         }
     }
     insert_breakdown[thread->thread].gc_cb_time += spdk_get_ticks() - start;

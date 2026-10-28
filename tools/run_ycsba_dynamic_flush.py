@@ -17,8 +17,8 @@ from run_ycsba_uniform_zipfian import Interrupted, interrupt, positive, existing
 from summarize_ycsba import count_requests, measured_result
 
 REPO = Path(__file__).resolve().parent.parent
-MODES = (('off', 0), ('on', 1))
-#MODES = (('on', 1),)
+#MODES = (('off', 0), ('on', 1))
+MODES = (('on', 1),('off',0))
 FIELDS = ['mode', 'dynamic_flush_enabled', 'distribution', 'workload', 'workers',
           'injectors', 'kv_size_bytes', 'cache_mib', 'tasks_per_thread', 'requests',
           'seconds', 'throughput_ops_s', 'nvm_limit_bytes', 'nvm_poll_ns',
@@ -57,7 +57,7 @@ Environment defaults:
   BUILD_JOBS=6 SPDK_ROOT=<repo>/../spdk RESULT_BASE=<repo>/results USE_SUDO=1
   TIMEOUT_SECONDS=0 KILL_AFTER_SECONDS=30
   SKIP_DRIVER_CHECK=0 (1 is intended only for mock-program tests)
-LIBDB_DYNAMIC_FLUSH_MODES defaults to the source MODES setting (OFF then ON).
+LIBDB_DYNAMIC_FLUSH_MODES defaults to the source MODES setting (ON then OFF).
 Set LIBDB_DYNAMIC_FLUSH_MODES=on or off to run only that mode once.
 REPEATS and BINARY are ignored.
 Selected binaries are built in this invocation's result directory before any run.

@@ -124,10 +124,10 @@ static struct thread * attach_workers_after_index(struct db * db , struct thread
         thread[i].curr_segment = get_free_segment(db->fs);
         thread[i].thread = i;
         thread[i].maintenance = NULL;
-        thread[i].deferred_flush = NULL;
         thread[i].read_pins = NULL;
         thread[i].servicing_maintenance = false;
         thread[i].merge_count = thread[i].merge_read_blocks = thread[i].merge_write_blocks = 0;
+        ssd_write_stats_init(&thread[i].ssd_writes);
         thread[i].kv_version_next = 0;
         thread[i].kv_version_limit = 0;
         thread[i].lru_list = lru_list_init(db->cachesize * 1024 * 1024 / db->thread);
@@ -857,6 +857,8 @@ void split_write_cb(void *arg, const struct spdk_nvme_cpl *completnio){
     if(spdk_nvme_cpl_is_error(completnio)){
         task->split_io_failed = 1;
         fprintf(stderr, "split SSD write completion reported an error\n");
+    } else {
+        ssd_write_completed(&thread->ssd_writes, SSD_WRITE_SPLIT, BLOCK_SIZE);
     }
     task->block_completed++;
     if(task->block_completed < task->total_block_num){
@@ -886,8 +888,6 @@ void split_write_cb(void *arg, const struct spdk_nvme_cpl *completnio){
     old_subspace_info->is_spliting = 0;
 
     reclaim_blocks(thread, task->block_array_to_gc, task->total_block_num_to_gc);
-    maintenance_request_flush(thread, old_subspace_info->boundary);
-    maintenance_request_flush(thread, new_subspace_info->boundary);
     free(task->block_array);
     free(task->block_array_to_gc);
     free(plan);
@@ -1075,6 +1075,8 @@ void flush_cb(void *arg, const struct spdk_nvme_cpl *completnio){
     if(spdk_nvme_cpl_is_error(completnio)){
         task->flush_io_failed = 1;
         fprintf(stderr, "flush SSD write completion reported an error\n");
+    } else {
+        ssd_write_completed(&thread->ssd_writes, SSD_WRITE_FLUSH, BLOCK_SIZE);
     }
     task->block_completed ++;
     if(task->block_completed < task->total_block_num){
@@ -1140,7 +1142,6 @@ void flush_cb(void *arg, const struct spdk_nvme_cpl *completnio){
     /*检查更新后的subspace的容量*/
     subspace_info->flush_block_num -- ;
     subspace_info->total_block_num += flushed_block_num;
-    maintenance_request_flush(thread, subspace_info->boundary);
 
     double gc_fraction = space_stats_gc_fraction(thread->db);
     if(subspace_info->key_num >= SUBSPACE_MAX_KEY){
@@ -1333,17 +1334,28 @@ void insert(key_type key , int size , char * value ,  struct thread * thread , s
         write_buffer_free(thread->kvbuffer, buffer_to_free.id , buffer_to_free.WBF_seq,  buffer_to_free.size ,&(thread->buffer_free_head));
     }
 
-    if(!subspace_maybe_flush(subspace_info, thread))
-        maintenance_request_flush(thread, subspace_info->boundary);
+    (void)subspace_maybe_flush(subspace_info, thread);
 }
 
+/* Called only after a foreground insert/update. Never schedule a retry. */
 bool subspace_maybe_flush(struct subspace_info *group, struct thread *thread){
-    if(group->buffered_size <= BLOCK_SIZE * Flush_Blcok_Num) return true;
-    if(!space_stats_nvm_flush_allowed(thread->db)){
-        maintenance_defer_flush(thread, group->boundary);
-        return true; /* Deferred work is not an active maintenance retry. */
+    for(;;){
+        if(group->buffered_size <= BLOCK_SIZE * Flush_Blcok_Num ||
+           !space_stats_nvm_flush_allowed(thread->db) || benchmark_completed) return true;
+        /* A busy group waits for its next write, not for this operation. */
+        if(subspace_busy(group)) return false;
+        if(!no_free_task(thread->ns_entry, thread->thread)) break;
+        /* Wait before detaching a batch or reserving SSD blocks. Only drive
+         * in-flight I/O, never maintenance. This idle group is worker-owned;
+         * recheck its state and the policy after completion callbacks. */
+        int rc = spdk_nvme_qpair_process_completions(
+            thread->ns_entry->qpair[thread->thread % ctr_max_qp], 0);
+        if(rc < 0){
+            fprintf(stderr, "flush: worker %d completion processing failed while waiting for a task (rc=%d)\n",
+                    thread->thread, rc);
+            exit(EXIT_FAILURE);
+        }
     }
-    if(subspace_busy(group)) return false;
     return flush_write_buffer_to_ssd(group, thread, thread->ns_entry, 0,
         flush_cb, 0, &insert_breakdown[thread->thread]) != 0;
 }

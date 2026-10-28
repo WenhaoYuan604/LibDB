@@ -59,104 +59,18 @@ bool read_cache_mapping_current(struct thread *thread, key_type key, struct addr
     return current.size && current.block == addr.block && current.off == addr.off && current.size == addr.size;
 }
 
-/* Worker-owned FIFO plus hash membership: deferral does not rescan all groups
- * on every insert, and queue entries survive pressure-free polling unchanged. */
-#define DEFERRED_BUCKETS 4096U
-struct deferred_flush_entry {
-    key_type key;
-    struct deferred_flush_entry *next, *hash_next;
-};
-struct deferred_flush_queue {
-    struct deferred_flush_entry *head, *tail, *buckets[DEFERRED_BUCKETS];
-    size_t count;
-};
-static unsigned deferred_bucket(key_type key){
-    uint64_t h = key;
-    h ^= h >> 33;
-    h *= UINT64_C(0xff51afd7ed558ccd);
-    h ^= h >> 33;
-    return h & (DEFERRED_BUCKETS - 1);
-}
-void maintenance_defer_flush(struct thread *thread, key_type key){
-    struct deferred_flush_queue *q = thread->deferred_flush;
-    if(!q){
-        q = calloc(1, sizeof(*q));
-        if(!q) abort();
-        thread->deferred_flush = q;
-    }
-    unsigned bucket = deferred_bucket(key);
-    for(struct deferred_flush_entry *p = q->buckets[bucket]; p; p = p->hash_next)
-        if(p->key == key) return;
-    struct deferred_flush_entry *p = malloc(sizeof(*p));
-    if(!p) abort();
-    *p = (struct deferred_flush_entry){.key=key, .hash_next=q->buckets[bucket]};
-    q->buckets[bucket] = p;
-    if(q->tail) q->tail->next = p; else q->head = p;
-    q->tail = p;
-    q->count++;
-}
-void maintenance_clear_deferred(struct thread *thread){
-    struct deferred_flush_queue *q = thread->deferred_flush;
-    if(!q) return;
-    while(q->head){
-        struct deferred_flush_entry *p = q->head;
-        q->head = p->next;
-        free(p);
-    }
-    free(q);
-    thread->deferred_flush = NULL;
-}
-static void deferred_flush_poll(struct thread *thread){
-    struct deferred_flush_queue *q = thread->deferred_flush;
-    if(!q || !space_stats_nvm_flush_allowed(thread->db)) return;
-    size_t budget = q->count < 16 ? q->count : 16;
-    for(size_t i = 0; i < budget && q->head; i++){
-        if(!space_stats_nvm_flush_allowed(thread->db)) break;
-        struct deferred_flush_entry *p = q->head;
-        struct subspace_info *group = dram_index_search(thread->index->dram_index, p->key, NULL, NULL);
-        bool done = !group || subspace_maybe_flush(group, thread);
-        /* Main may have removed pressure during the call. Preserve eligibility
-         * even if subspace_maybe_flush just deduplicated against this entry. */
-        if(group && group->buffered_size > BLOCK_SIZE * Flush_Blcok_Num &&
-           !space_stats_nvm_flush_allowed(thread->db)) done = false;
-        q->head = p->next;
-        if(q->tail == p) q->tail = NULL;
-        if(!done){
-            p->next = NULL;
-            if(q->tail) q->tail->next = p; else q->head = p;
-            q->tail = p;
-        } else {
-            struct deferred_flush_entry **link = &q->buckets[deferred_bucket(p->key)];
-            while(*link != p) link = &(*link)->hash_next;
-            *link = p->hash_next;
-            q->count--;
-            free(p);
-        }
-    }
-}
-
 struct pending_maintenance {
     key_type key;
-    bool merge;
     struct pending_maintenance *next;
 };
 
-static void request(struct thread *thread, key_type key, bool merge){
+static void request_merge(struct thread *thread, key_type key){
     for(struct pending_maintenance *p = thread->maintenance; p; p = p->next)
-        if(p->key == key && p->merge == merge) return;
+        if(p->key == key) return;
     struct pending_maintenance *p = malloc(sizeof(*p));
     if(!p) abort();
-    *p = (struct pending_maintenance){key, merge, thread->maintenance};
+    *p = (struct pending_maintenance){key, thread->maintenance};
     thread->maintenance = p;
-}
-
-void maintenance_request_flush(struct thread *thread, key_type key){
-    if(LIBDB_DYNAMIC_FLUSH_ENABLED && thread->db &&
-       atomic_load_explicit(&thread->db->nvm_flush.phase, memory_order_acquire) != NVM_FLUSH_FIXED){
-        struct subspace_info *group = dram_index_search(thread->index->dram_index, key, NULL, NULL);
-        if(group && group->buffered_size > BLOCK_SIZE * Flush_Blcok_Num)
-            maintenance_defer_flush(thread, group->boundary);
-    } else request(thread, key, false);
 }
 
 /* Initial ranges are striped across workers. Never remove their fences. */
@@ -214,7 +128,6 @@ static void merge_commit(struct merge_plan *plan){
     group->is_merging = false;
     reclaim_blocks(thread, plan->sources, plan->source_count);
     thread->merge_count++;
-    maintenance_request_flush(thread, group->boundary);
     spdk_free(plan->packed);
     free_task(plan->task);
     free(plan);
@@ -223,6 +136,7 @@ static void merge_commit(struct merge_plan *plan){
 static void merge_write_cb(void *arg, const struct spdk_nvme_cpl *cpl){
     struct merge_plan *plan = arg;
     if(spdk_nvme_cpl_is_error(cpl)) plan->failed = true;
+    else ssd_write_completed(&plan->thread->ssd_writes, SSD_WRITE_MERGE, BLOCK_SIZE);
     if(++plan->completed != plan->dest_count) return;
     if(plan->failed) merge_fatal("SSD write failed");
     merge_commit(plan);
@@ -398,7 +312,7 @@ static bool merge_try(struct thread *thread, key_type key){
 }
 
 void merge_check_after_delete(struct thread *thread, key_type key){
-    if(!merge_try(thread, key)) request(thread, key, true);
+    if(!merge_try(thread, key)) request_merge(thread, key);
 }
 
 void maintenance_poll(struct thread *thread){
@@ -409,18 +323,8 @@ void maintenance_poll(struct thread *thread){
     while(batch){
         struct pending_maintenance *p = batch;
         batch = p->next;
-        bool done;
-        if(p->merge) done = merge_try(thread, p->key);
-        else{
-            struct subspace_info *group = dram_index_search(thread->index->dram_index, p->key, NULL, NULL);
-            done = !group || subspace_maybe_flush(group, thread);
-        }
-        if(!done){
-            if(p->merge) request(thread, p->key, true);
-            else maintenance_request_flush(thread, p->key);
-        }
+        if(!merge_try(thread, p->key)) request_merge(thread, p->key);
         free(p);
     }
-    deferred_flush_poll(thread);
     thread->servicing_maintenance = false;
 }

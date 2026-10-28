@@ -4,12 +4,9 @@
 #include "task.h"
 struct thread;
 
-/* Queue by key: structural callbacks may replace a group before retry. */
+/* Merge-only retries, keyed because structural changes can replace groups. */
 void merge_check_after_delete(struct thread *thread, key_type key);
-void maintenance_request_flush(struct thread *thread, key_type key);
 void maintenance_poll(struct thread *thread);
-void maintenance_defer_flush(struct thread *thread, key_type key);
-void maintenance_clear_deferred(struct thread *thread);
 bool merge_same_partition(struct thread *thread, key_type left, key_type right);
 
 void read_pin_blocks(struct thread *thread, const uint32_t *blocks, size_t count);

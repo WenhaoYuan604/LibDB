@@ -33,10 +33,9 @@ int spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *q, uint32_t max)
     }
     return 0;
 }
-void maintenance_clear_deferred(struct thread *t) { t->deferred_flush = NULL; }
 void maintenance_poll(struct thread *t) {
     maintenance_calls++;
-    /* A queued retry cannot finish until the pending write completes. */
+    /* A queued merge retry cannot finish until the pending write completes. */
     if(!pending) t->maintenance = NULL;
 }
 char *get(key_type key, struct thread *t, int *size, uint64_t start,
@@ -65,8 +64,6 @@ static void setup(bool delayed) {
     free_task(&tasks[0]); if(!delayed) free_task(&tasks[1]);
     pending = delayed;
     worker.maintenance = delayed ? (struct pending_maintenance *)&worker : NULL;
-    /* Dormant flush work must not keep the real worker exit loop alive. */
-    worker.deferred_flush = (struct deferred_flush_queue *)&worker;
     space_stats_nvm_init(&db);
     atomic_store(&db.nvm_flush.phase, NVM_FLUSH_STOPPED);
     thread_completed = completed; completed[0] = 0;
@@ -82,7 +79,7 @@ int main(void) {
     assert(!space_stats_snapshot(&db, &snapshot) && snapshot.used_blocks == 1);
     setup(false); queued_request = false;
     assert(server_executor(&worker) == 0);
-    assert(polls == 1 && reads == 0 && !worker.deferred_flush);
+    assert(polls == 1 && reads == 0);
     assert(!space_stats_snapshot(&db, &snapshot) && snapshot.used_blocks == 0);
     return 0;
 }

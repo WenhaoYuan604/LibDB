@@ -15,7 +15,10 @@ struct pending_scan_request {
 
 void client_initialize(struct db * db);
 
-void client_executor(struct db * db)  ;
+extern struct db *client_monitor_db;
+extern int test_get_num, test_insert_num, test_update_num, test_scan_num;
+bool client_initialize_load_injectors(struct db *, struct user_rq *, int);
+void client_executor(struct db * db);
 
 int client_initialize_request_ring(struct db * db) ;
 

@@ -47,6 +47,12 @@ int libdb_config_set_warm_path(const char *value)
                              sizeof(g_libdb_config.warm_path), value);
 }
 
+int libdb_config_set_precondition_path(const char *value)
+{
+    return copy_config_value(g_libdb_config.precondition_path,
+                             sizeof(g_libdb_config.precondition_path), value);
+}
+
 int libdb_config_set_test_path(const char *value)
 {
     return copy_config_value(g_libdb_config.test_path,
@@ -119,6 +125,15 @@ int libdb_config_validate(char *error, size_t error_size)
                  g_libdb_config.warm_path[0] ? g_libdb_config.warm_path : "(unset)");
         return -1;
     }
+    if (g_libdb_config.precondition_path[0] != '\0' &&
+        (stat(g_libdb_config.precondition_path, &status) != 0 ||
+         !S_ISREG(status.st_mode) ||
+         access(g_libdb_config.precondition_path, R_OK) != 0 ||
+         strstr(g_libdb_config.precondition_path, "Production") != NULL ||
+         strstr(g_libdb_config.test_path, "Production") != NULL)) {
+        snprintf(error, error_size, "precondition requires readable YCSB A and YCSB test traces");
+        return -1;
+    }
     if (g_libdb_config.test_path[0] == '\0' || access(g_libdb_config.test_path, R_OK) != 0) {
         snprintf(error, error_size, "test workload '%s' is not readable",
                  g_libdb_config.test_path[0] ? g_libdb_config.test_path : "(unset)");
@@ -132,6 +147,8 @@ void libdb_config_print(FILE *stream)
     fprintf(stream, "NVMe PCI address: %s\n", g_libdb_config.pci_addr);
     fprintf(stream, "PMEM directory: %s\n", g_libdb_config.pmem_dir);
     fprintf(stream, "Warm workload: %s\n", g_libdb_config.warm_path);
+    if (g_libdb_config.precondition_path[0] != '\0')
+        fprintf(stream, "Precondition workload: %s\n", g_libdb_config.precondition_path);
     fprintf(stream, "Test workload: %s\n", g_libdb_config.test_path);
 }
 

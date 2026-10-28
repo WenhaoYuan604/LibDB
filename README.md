@@ -1,6 +1,6 @@
 # LibDB
 
-当前版本：**0.3.0**。版本更新和兼容性说明见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本：**0.4.0**。版本更新和兼容性说明见 [CHANGELOG.md](CHANGELOG.md)。
 
 本仓库提供 LibDB 的可复现实验代码和脚本。下面只给出从编译到运行 YCSB A/C 与 recovery 的最短流程。
 
@@ -142,7 +142,8 @@ results/heavy_ac_<timestamp>/
 此时保留原 PMEM 索引，读取仍使用旧 SSD 地址。迁移期间的新写入进入合并后的 GWB，
 暂停该组 flush、GC 和其他结构变更。目标块使用 FUA 写入；全部完成后更新 PMEM slots，
 再回收旧 slots 和源块。未完成的 get/scan 会保留旧 group 和源块的引用，避免提前复用。
-完成后按 DMA 容量和 slot 容量分批处理积压 GWB，并继续使用现有 split/GC 流程。
+合并完成后不主动 Flush；后续写入该组时，按 DMA 容量和 slot 容量启动有界批次，
+并继续使用现有 split/GC 流程。
 
 本实现不提供 **merge 中途崩溃恢复协议**。正常完成后的持久索引可由现有 recovery
 代码恢复。发布逻辑合并后的 I/O 或持久化错误会终止进程并保留源块，不保证此时可恢复。
@@ -167,14 +168,16 @@ ctest --test-dir build --output-on-failure
 ```bash
 cmake -S . -B /tmp/libdb-merge-asan -DSPDK_ROOT="$SPDK_ROOT" \
   -DLIBDB_TEST_SANITIZERS=ON
-cmake --build /tmp/libdb-merge-asan --target merge_test gc_tail_wbf_test allocator_test --parallel
+cmake --build /tmp/libdb-merge-asan --target merge_test merge_off_test gc_tail_wbf_test allocator_test --parallel
 ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
-  ctest --test-dir /tmp/libdb-merge-asan --output-on-failure -R '^(merge|gc_tail_wbf|allocator)$'
+  ctest --test-dir /tmp/libdb-merge-asan --output-on-failure -R '^(merge|merge_off|gc_tail_wbf|allocator)$'
 ```
 
 测试以独立子进程隔离场景，覆盖阈值、重复键、空组、跨叶节点 fence 删除、cache/LRU、
-延迟 get/scan、迁移期间写入、删除等待、资源重试、I/O/提交失败、变长记录、积压 flush、
-后续 split/GC，以及关闭并重新打开 PMDK pool 后调用现有 recovery 重建索引。
+延迟 get/scan、迁移期间写入、删除等待、资源重试、I/O/提交失败、变长记录、
+写入驱动的有界 Flush、后续 split/GC，以及关闭并重新打开 PMDK pool 后调用现有 recovery
+重建索引。`merge` 和 `merge_off` 分别验证动态 ON/OFF：高压力下维护与读取不启动 Flush、
+只刷本次写入组、忙碌时写入仍生效、task 等待与取消、轮询错误退出和完成回调不续刷。
 
 ### 动态 GC 阈值
 
@@ -191,12 +194,19 @@ key/slot 容量时才补齐；遇到下一条放不下的记录就停止，不�
 回迁保留原始版本、逻辑 value 长度和有效的 32 字节前缀，已有相同或更新的 PMEM 版本不会
 被覆盖。回迁沿用 WBF 分配、回收和空间计数接口：压力标志不禁止回迁，但仍遵守现有 16GiB
 文件容量硬上限；没有可用槽位且无法扩容时沿用失败终止策略。回迁过程和该分支的完成回调
-不新增 Flush 请求，原先已登记的维护或延后 Flush 请求仍可在 GC 完成后执行。
+不新增 Flush 请求，只有后续前台写入该组才会再次检查 Flush 条件。
 
-目标 SSD 块使用 FUA 写入；全部写入完成后提交索引槽位，再更新内存元数据、清理旧缓存、
+GC 目标 SSD 块的写入标志为 `0`；全部写入完成后仅提交受影响的索引槽位，再更新内存元数据、
 回收冻结记录和无引用源块。尚未完成的读取会推迟物理块复用。补齐按 key 合并映射，避免
 旧 SSD 地址与补齐记录重复；不再引用的输出块不会分配或写入。持久化记录格式不变，
 沿用现有逐槽位提交及恢复协议，不提供跨槽位的原子提交保证。
+GC 保留原有槽位布局，只更新搬迁记录的地址；回迁只在原槽位内删除并压紧条目，回收变空的
+槽位。补齐新增 key 沿用槽内有序插入及必要的局部槽位分裂，不排序、重排或提交整个组。
+补齐前按各槽位实际需要的容量检查上限，无法容纳时采用回迁。
+普通搬迁和尾部回迁保留现有缓存；仅在补齐批次解除冻结前删除该批次 key 的旧缓存。
+块引用只更新被搬迁、回迁或补齐替换的映射，未受影响映射保持不变。打包暂存区按本次
+选中块数乘以 4KiB 分配，检查实际容量边界，仅清零输出块未使用的部分。变长记录按 key
+重排后若超出该容量，沿用失败终止策略并保留源块，不自动扩大暂存区。
 
 `merge` 测试包含尾块分支、覆盖写、延迟 get/scan、计数、维护队列及故障注入；
 `gc_tail_wbf` 使用模拟 NVMe 和真实临时 PMDK/WBF 文件，覆盖补齐、回迁、重启恢复及小预算
@@ -257,8 +267,8 @@ Bash 入口调用 Python 3 标准库工具，无第三方 Python 依赖。`SKIP_
 sudo ./run_ycsba_dynamic_flush.sh
 ```
 
-脚本默认从当前源码独立构建动态 Flush **OFF、ON** 两个版本，均构建成功后
-按 **OFF → ON** 各运行一次 uniform YCSB A。设置 `LIBDB_DYNAMIC_FLUSH_MODES=on`
+脚本默认从当前源码独立构建动态 Flush **ON、OFF** 两个版本，均构建成功后
+按 **ON → OFF** 各运行一次 uniform YCSB A。设置 `LIBDB_DYNAMIC_FLUSH_MODES=on`
 或 `off` 可仅运行对应模式。每次创建全新数据库，依次执行 load、缓存预热和正式 A；
 两种模式使用相同输入和参数，编译时仅 `LIBDB_DYNAMIC_FLUSH_ENABLED` 不同。
 默认采用 16GiB WBF 文件硬上限、14GiB/12GiB 高低水位及 100ms 采样周期。
@@ -279,7 +289,7 @@ sudo ./run_ycsba_dynamic_flush.sh
 | `UNIFORM_WARM_FILE`、`UNIFORM_YCSBA_FILE` | 根目录下 `uniform/warm.txt`、`uniform/ycsba.txt` |
 | `BUILD_JOBS`、`SPDK_ROOT` | 6；项目同级 `spdk` 目录 |
 | `RESULT_BASE` | 项目下 `results` |
-| `LIBDB_DYNAMIC_FLUSH_MODES` | 当前源码默认 `off,on`；可选 `on` 或 `off` |
+| `LIBDB_DYNAMIC_FLUSH_MODES` | 当前源码默认 `on,off`；可选 `on`、`off` 或 `off,on` |
 | `TIMEOUT_SECONDS` | 0（不限时）；非零时分别限制每个配置、构建或数据库进程 |
 | `KILL_AFTER_SECONDS`、`USE_SUDO` | 30；1（非 root 用户通过 sudo 准备 PMEM、运行数据库） |
 
@@ -303,7 +313,7 @@ sudo env BUILD_JOBS=8 THREADS=16 ./run_ycsba_dynamic_flush.sh
 通常为 0，不应当作实际占用峰值；最终槽位占用仍可用于比较。
 
 输入或构建失败时不启动数据库；运行失败、统计不符、超时或中断时停止后续测试并保留
-结果。OFF 结束后释放其专属 PMEM 目录，再运行 ON。清理只涉及本次新建的私有子目录，
+结果。ON 结束后释放其专属 PMEM 目录，再运行 OFF。清理只涉及本次新建的私有子目录，
 不删除 PMEM 父目录或已有数据；无法终止数据库时保留对应目录。脚本不切换驱动、不进行
 CPU/NUMA 调优，也不生成 workload。
 
@@ -380,11 +390,22 @@ WBF 文件容量总和在所有阶段严格限制为 16GiB；默认每个文件 
 recovery 仍会重建未回收记录计数，但未恢复到可用空闲链表的空槽位不计入可复用空间。
 
 单组 Flush 条件始终为 `buffered_size > BLOCK_SIZE * Flush_Blcok_Num`，默认严格超过
-16KiB。延后队列仍按路由 key 去重，每次维护轮询最多处理 16 个条目；无后续写入的组
-也能响应压力。正式 workload 完成后停止新的压力 Flush，排空已提交 I/O 和必要维护，
-不强制刷空延后组。
+16KiB。所有阶段（load、动态 ON/OFF、恢复后的写入）都仅由前台 insert/update
+检查本次写入的组；不登记待 Flush 组，不在读请求、空闲轮询或完成回调中续刷。
+高水位只开启 Flush 许可，不主动排空积压；没有后续写入的冷组可以长期保留缓冲，
+因此压力不保证自动回到低水位。动态 OFF 和 load 沿用局部阈值，不受压力门控。
 
-本版本不增加分配等待、背压、跨 worker 空闲共享或不足 16KiB 的紧急 Flush。如果局部
+写入先正常进入缓存并更新索引，再检查是否触发 Flush。
+组正在 Flush、split、GC 或 merge 时，只跳过本次 Flush，等待下一次写入该组。
+组空闲但无可用 task 时，当前写入轮询自己的 qpair 等待已有 I/O 释放 task；
+每次轮询后重新检查组状态、阈值和 Flush 许可，许可关闭、阶段结束或组变忙就放弃本次 Flush。
+轮询错误会终止程序。等待期间不拆分缓冲批次、不分配 SSD 块、不调用维护调度、不扫描其他组。
+一次写入最多提交一批（沿用最多64条记录及现有 DMA 上限），剩余缓冲等待新写入。
+已提交 I/O 正常完成，GC、分裂和删除触发的合并规则保留，但完成后不额外续刷。
+正式 workload 完成后排空已提交 I/O 和必要的合并维护，不强制刷空写缓冲。
+
+本版本的 task 等待不等于 WBF 槽位分配等待；不增加 WBF 分配等待、背压、
+跨 worker 空闲共享或不足 16KiB 的紧急 Flush。如果局部
 槽位不足且扩容将突破预算，打印 `WBF hard limit` 并沿用分配失败终止路径，绝不创建
 超预算文件。提前水位用于避免触碰限额，但不保证所有负载都能持续写入。16GiB 只约束
 WBF 文件容量，不包含 leaf-node 索引或其他文件系统开销。
@@ -395,6 +416,148 @@ WBF 文件容量，不包含 leaf-node 索引或其他文件系统开销。
 创建时记录，不依赖周期采样。实验汇总同时识别新旧日志，旧日志不会被标记为硬上限已验证；
 出现容量拒绝时明确报告 `capacity_limit`，即使进程已在最终统计前退出。
 
-实验脚本保留源码当前默认的 ON 单模式；可用 `LIBDB_DYNAMIC_FLUSH_MODES=off,on` 运行
-OFF/ON 对比。新实验验收要求文件容量峰值不超过 16GiB、正常完成、上限拒绝次数为 0。
+实验脚本默认按 ON → OFF 对比；可用 `LIBDB_DYNAMIC_FLUSH_MODES=on` 仅运行 ON，
+或设为 `off,on` 调整顺序。新实验验收要求文件容量峰值不超过 16GiB、正常完成、上限拒绝次数为 0。
 无设备测试以小预算临时 PMDK 文件覆盖并发扩容、回收复用及恢复拒绝；不触碰既有实验文件。
+
+### 不同 KVsize：Uniform / Zipfian YCSB A 吞吐量（当前仅测试 A）
+
+```bash
+sudo ./run_ycsb_ae_kvsize.sh
+# 可选：每个组合重复三次
+sudo env REPEATS=3 ./run_ycsb_ae_kvsize.sh
+```
+
+脚本内 `REPEATS` 初始为 **1**，支持环境变量覆盖。每轮按下表从上到下执行，
+每种 KVsize 依次运行 **uniform A → zipfian A**，
+共 8 次独立数据库测试。固定 **TASKS_PER_THREAD=16**，默认 16 workers、8 injectors。
+
+| KVsize（字节） | Cache（GiB / 传入的 MiB） | WBF 文件容量硬上限（GiB） | Flush 高 / 低水位（GiB） | 局部 Flush 阈值（Block / KiB） |
+| --- | --- | --- | --- | --- |
+| 1024 | 20 / 20480 | 16 | 14 / 12 | 4 / 16 |
+| 512 | 10 / 10240 | 8 | 7 / 6 | 2 / 8 |
+| 256 | 5 / 5120 | 4 | 3 / 2 | 1 / 4 |
+| 128 | 1 / 1024 | 4 | 3 / 2 | 1 / 4 |
+
+脚本使用当前工作区的最新源码（包括未提交修改），在本次结果目录中重新独立构建四份程序，显式启用动态 Flush 并设置各组硬上限和
+高低水位，采样间隔为 100ms；全部构建成功后才启动数据库。现有动态 GC 策略保持启用。
+WBF 硬上限在全部阶段有效，动态 Flush 在正式 A 阶段启用。
+
+每个 Block 为 4096 字节，各组编译时显式设置 `LIBDB_FLUSH_BLOCK_COUNT=4/2/1/1`。
+该宏默认值仍为 4，允许编译参数覆盖且必须为正整数。沿用最新系统规则：只有前台写入后，
+组缓冲大小**严格大于**局部阈值且动态策略允许时才尝试 Flush；忙组与任务资源等待逻辑保持现有实现。
+这项局部阈值与 WBF 全局容量高低水位分别记录。
+
+本实验所称的 WAL 开启指**保留现有 PMEM 持久化写缓冲路径**，没有新增独立 WAL。
+当前代码按 KVsize 分配完整逻辑记录，但只赋值并持久化记录头与 **32 字节 value 前缀**。
+
+每次独立测试使用全新数据库，流程为：**对应分布 load → 缓存 warmup → 对应分布 A**。
+脚本名称和运行命令保留不变，当前只运行 A，不读取或要求 E 的输入文件，也不传入
+`--precondition`。四种 KVsize 都按相同流程执行。
+
+数据库的可选接口 `--precondition=FILE` 和汇总器的 E 解析能力保留，供后续恢复 E 测试。
+该接口会在 warmup 后、正式 test 前执行 YCSB A trace，保留同一数据库状态；前置 trace
+必须包含整千条 READ/UPDATE 请求。当前矩阵脚本及旧的 `run_ycsbe_latency_task2.sh`
+均不传此参数。
+
+| 环境变量 | 默认值 / 含义 |
+| --- | --- |
+| `REPEATS` | 1，正整数，每轮包含完整的 8 个组合 |
+| `WORKLOAD_ROOT` | `/mnt/nvme0n1/why/ycsb_workloads_one_warm` |
+| `UNIFORM_WARM_FILE`、`UNIFORM_YCSBA_FILE` | 根目录下 `uniform/warm.txt`、`uniform/ycsba.txt` |
+| `ZIPFIAN_WARM_FILE`、`ZIPFIAN_YCSBA_FILE` | 根目录下 `zipfian/` 对应文件 |
+| `THREADS`、`LOAD_INJECTORS`、`KV_COUNT`、`BOUNDARY_SIZE` | 16、8、100000000、1000；KV_COUNT 仅用于队列配置，不截断 trace |
+| `PCI_ADDR`、`PMEM_BASE`、`LIBDB_ALLOW_DESTRUCTIVE` | `0000:5c:00.0`、`/mnt/whypmem`、1；显式设为 0 禁止实验 |
+| `SPDK_ROOT`、`BUILD_JOBS` | 项目同级 `spdk` 目录、6 |
+| `RESULT_BASE`、`USE_SUDO` | 项目 `results` 目录、1 |
+| `TIMEOUT_SECONDS`、`KILL_AFTER_SECONDS` | 0（不限时）、30；超时分别作用于每个配置、构建或数据库进程，数据库超时包含全部阶段 |
+
+`KV_SIZE`、`CACHE_SIZE_MB`、`TASKS_PER_THREAD`、`BINARY` 和 `LIBDB_DYNAMIC_FLUSH_MODES`
+环境变量不会改变此矩阵。输入必须至少 1000 条且为千条整数倍；全部四个文件在构建前
+检查并统计条数。不同 KVsize 使用相同 trace，不自动生成新数据或调整记录数。
+脚本沿用设备绑定检查，不修改 CPU/NUMA 或 NVMe 驱动；实验 SSD 必须允许覆盖。
+只清理本次新建的私有 PMEM 子目录，不删除父目录已有内容或 workload。
+
+结果保存于 `results/ycsb_ae_kvsize_<时间>_<唯一标识>/`：四组构建产物、`config.json`、
+每阶段命令、实时输出的完整日志、程序结果、`status.json`、`summary.csv` 和 `aggregate.csv`。
+文件名例如 `01_kv1024_zipfian_A.log`。日志与结果文件中使用
+`Benchmark phase: begin/end load/warmup/measured` 标记阶段。
+
+汇总器校验 load、warmup、正式 A 三个阶段，请求数、操作类型、耗时、动态 Flush 配置及
+采样统计必须一致；程序结果中 `LIBDB_FLUSH_BLOCK_COUNT` 必须存在且与本组一致，缺失、重复或不符则判定结果无效。正式吞吐量单位为 ops/s，不包含 load 和 warmup。
+`summary.csv` 保留各次配置、请求数、正式吞吐量及状态；前置文件列为空、前置请求数为 0。
+`config.json` 的 `FLUSH_THRESHOLDS`、明细及汇总 CSV 均记录 `flush_block_count` 和
+`flush_threshold_bytes`。旧 CSV 缺少这两列时保留为空，不推测历史阈值。
+`aggregate.csv` 按 KVsize、分布、workload 及局部 Flush 阈值分组，统计成功次数、均值、样本标准差、最小值和最大值。
+仅成功测试参与汇总，一次成功的标准差为 0，没有成功时统计值留空。
+`nvm_sampled_peak_bytes`、压力采样峰值和切换次数对应正式阶段；
+`wbf_file_peak_bytes` 是**整次运行**的文件容量峰值（`wbf_file_peak_scope=whole_run`）。
+
+输入、构建、运行、解析失败或超时、中断时停止后续组合并保留已有结果。
+清理前先终止数据库；无法终止时保留 PMEM 目录。只需编写/验证脚本时不应执行真实硬件实验。
+
+```bash
+./run_ycsb_ae_kvsize.sh --help
+python3 tests/test_ycsb_ae_kvsize.py -v
+cmake --build build --target client_workload_test --parallel
+ctest --test-dir build --output-on-failure -R '^client_workload$'
+python3 tools/summarize_ycsb_ae_kvsize.py results/<本次运行目录>/summary.csv
+```
+
+以上 Python 测试使用模拟 CMake 和数据库，验证仅 A 的 8 个组合、缺少 E 文件、重复轮数、
+失败退出及保留的 E 解析能力；C 测试使用真实阶段编排与动态 Flush 控制器、
+模拟请求读取和执行，覆盖无前置阶段、A→E、阶段计数/采样重置、状态保留和前置失败。
+这些测试均不打开真实实验设备。
+
+## GC-heavy uniform YCSB A：最后 100M 操作
+
+```bash
+./run_ycsba_gc_heavy.sh
+```
+
+脚本在独立结果目录编译当前源码，然后在同一全新数据库中依次执行：
+`warm.txt` 加载 100M KV → 现有缓存预热 → `ycsba1.txt` 前置运行 150M 操作 →
+`ycsba2.txt` 测量 100M 操作。默认 trace 位于 `/home/why/LibDB/workloads_unif`。
+三个文件必须分别为 100M、150M、100M 条合法请求；加载只接受 INSERT，两个 A 阶段只接受
+READ/UPDATE，并按 trace 的实际读写数计算结果，不假设恰好 50M 次 UPDATE。
+
+默认配置：1024 字节完整逻辑 KV、16 workers、8 injectors、**20GiB cache
+（`CACHE_SIZE_MB=20480`，单位 MiB）**、每 worker 16 tasks、boundary size 1000。
+运行一轮，保留当前源码的动态 GC、动态 Flush、WBF 容量及局部 Flush 阈值。
+`BINARY`、`REPEATS` 不改变此流程。默认实验 SSD 为 `0000:5c:00.0`，PMEM 父目录为
+`/mnt/whypmem`，`LIBDB_ALLOW_DESTRUCTIVE=1`；显式设为 0 禁止实验。
+实验盘须允许覆盖并已绑定 SPDK 驱动。脚本不修改设备绑定，只清理本次创建的私有 PMEM 子目录。
+
+可覆盖 `WORKLOAD_ROOT`、`WARM_FILE`、`PRECONDITION_FILE`、`TEST_FILE`、`THREADS`、
+`LOAD_INJECTORS`、`KV_SIZE`、`CACHE_SIZE_MB`、`TASKS_PER_THREAD`、`BOUNDARY_SIZE`、
+`PCI_ADDR`、`PMEM_BASE`、`SPDK_ROOT`、`BUILD_JOBS`、`RESULT_BASE`、`USE_SUDO`、
+`TIMEOUT_SECONDS`、`KILL_AFTER_SECONDS`。`TIMEOUT_SECONDS=0` 默认不限时；非零时分别限制
+configure、build、整个数据库进程（包括加载及前置阶段）。`SKIP_DRIVER_CHECK=1` 仅供模拟测试。
+
+统计窗口在释放请求线程之前开始，全部前台请求完成后结束。读取 trace、构建和打印报告不计时。
+每个 worker 通过独立原子计数器记录成功完成的 Flush、GC、Split、Merge SSD 写入字节数；
+计数器在数据库生命周期内不清零，窗口采用起止快照差值。各线程、各类别依次采样，存在很小的
+采样边界偏差；不暂停后台工作，也不在窗口结束强制刷空 PMEM。后台写完成按完成时间归入窗口，
+因此可能包括前置工作延续到窗口中的写入，而不包括窗口结束后才完成的写入。
+
+- 吞吐量：`100000000 / seconds`，同时输出 ops/s 和 Mops/s。
+- SSD 写放大：`(flush_bytes + gc_bytes + split_bytes + merge_bytes) / (updates × KV_SIZE)`。
+  分母为完整逻辑 KV 字节数（含记录头），不是 PMEM 实际持久化的 value 前缀长度。
+  分子不含 PMEM 写入，也不表示 SSD 内部 NAND 写放大。
+- `gc_observed` 表示最后 100M 窗口中是否有 GC 写完成；为 false 时明确报告 GC-heavy 未验证。
+  该标志只证明观察到 GC，不量化 GC 压力等级。
+
+结果位于 `results/ycsba_gc_heavy_<时间>_<唯一标识>/`，包括构建产物、构建日志、命令 JSON、
+`config.json`、`uniform_A.log`、`uniform_A.result.txt`、`status.json` 和 `summary.csv`。
+`SSD window: {...}` 为新增结构化窗口统计，日志和结果文件必须一致；脚本不使用旧 `WA is` 行。
+汇总记录各类写入量、实际读写数、逻辑更新字节数、耗时、吞吐量、写放大及 GC 标志。
+缺失/重复阶段、计数不一致、无效统计、非零退出及超时都导致失败，不打印成功指标。
+
+已成功运行的结果可独立重新校验并输出 JSON：
+
+```bash
+python3 tools/summarize_ycsba_gc_heavy.py results/ycsba_gc_heavy_<时间>_<唯一标识>
+```
+
+无设备模拟测试：`python3 tests/test_ycsba_gc_heavy.py`。启用 `BUILD_TESTING` 后，CTest
+同时包含该测试和 `ssd_window`；现有 Merge/GC/Flush 模拟 SSD 测试还会校验成功与失败写完成计数。

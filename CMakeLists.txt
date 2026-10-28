@@ -61,7 +61,7 @@ message(STATUS "SPDK_LIBRARIES: ${SPDK_LIBRARIES}")
 
 # add_executable(test main.c base.c client.c db.c index.c  kvbuffer.c kvcache.c nvme_pipe.c pmdk.c server.c spdk_struct.c spdk_poller.c subspace.c ../spdk/lib/nvme/nvme_pcie.c)
 
-add_executable(libdb space_stats.c main.c base.c config.c client.c dram_index.c garbadge_c.c get.c hist.c index.c insert.c kvbuffer.c kvcache.c leaf_node_file.c
+add_executable(libdb space_stats.c main.c base.c config.c client.c client_workload.c dram_index.c garbadge_c.c get.c hist.c index.c insert.c kvbuffer.c kvcache.c leaf_node_file.c
 merge_flush.c nvm_index.c nvme_pipe.c pmdk.c recovery.c scan.c server.c spdk_struct.c subspace.c task.c write_buffer_index.c ${SPDK_ROOT}/lib/nvme/nvme_pcie.c)
 
 # # 链接 SPDK 和 DPDK 库
@@ -88,6 +88,25 @@ set_target_properties(libdb PROPERTIES
 # Tests use memory-backed NVMe and ordinary temporary PMDK files, never a device.
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(ssd_window_test tests/ssd_window_test.c)
+    target_include_directories(ssd_window_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(ssd_window_test PRIVATE -fcommon -ffunction-sections -fdata-sections -UNDEBUG)
+    target_link_options(ssd_window_test PRIVATE -Wl,--gc-sections)
+    target_link_libraries(ssd_window_test PRIVATE pthread)
+    add_test(NAME ssd_window COMMAND ssd_window_test)
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME ycsba_gc_heavy_runner COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ycsba_gc_heavy.py)
+    endif()
+    add_executable(client_workload_test tests/client_workload_test.c client_workload.c config.c space_stats.c)
+    target_include_directories(client_workload_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(client_workload_test PRIVATE -fcommon -ffunction-sections -fdata-sections -UNDEBUG)
+    target_link_options(client_workload_test PRIVATE -Wl,--gc-sections
+        -Wl,--wrap=space_stats_gc_wait -Wl,--wrap=space_stats_gc_poll)
+    target_link_libraries(client_workload_test PRIVATE pthread)
+    add_test(NAME client_workload COMMAND client_workload_test)
+    set_tests_properties(client_workload PROPERTIES TIMEOUT 15)
     foreach(mode IN ITEMS enabled disabled)
         add_executable(nvm_control_${mode}_test tests/nvm_control_test.c space_stats.c)
         target_include_directories(nvm_control_${mode}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -121,21 +140,27 @@ if(BUILD_TESTING)
     target_link_libraries(wbf_occupancy_test PRIVATE pmemobj pmem pthread)
     add_test(NAME wbf_occupancy COMMAND wbf_occupancy_test)
     set_tests_properties(wbf_occupancy PROPERTIES TIMEOUT 30)
-    add_executable(merge_test tests/merge_test.c space_stats.c dram_index.c subspace.c
-        write_buffer_index.c kvcache.c nvm_index.c merge_flush.c task.c get.c
-        scan.c insert.c index.c garbadge_c.c leaf_node_file.c recovery.c)
-    target_compile_definitions(merge_test PRIVATE LIBDB_NVM_FLUSH_HIGH_BYTES=65536 LIBDB_NVM_FLUSH_LOW_BYTES=32768)
-    target_include_directories(merge_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_options(merge_test PRIVATE -fcommon -ffunction-sections -fdata-sections -UNDEBUG)
-    target_link_options(merge_test PRIVATE -Wl,--gc-sections
-        -Wl,--wrap=nvm_index_get_free_node -Wl,--wrap=nvm_index_reserve_free_nodes
-        -Wl,--wrap=nvm_index_commit_slot_updates)
-    target_link_libraries(merge_test PRIVATE pmemobj pmem pthread m)
     option(LIBDB_TEST_SANITIZERS "Enable ASan/UBSan for merge tests" OFF)
-    if(LIBDB_TEST_SANITIZERS)
-        target_compile_options(merge_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
-        target_link_options(merge_test PRIVATE -fsanitize=address,undefined)
-    endif()
+    # Exercise write-triggered flushing with both dynamic policy settings.
+    foreach(merge_target IN ITEMS merge_test merge_off_test)
+        add_executable(${merge_target} tests/merge_test.c space_stats.c dram_index.c subspace.c
+            write_buffer_index.c kvcache.c nvm_index.c merge_flush.c task.c get.c
+            scan.c insert.c index.c garbadge_c.c leaf_node_file.c recovery.c)
+        target_compile_definitions(${merge_target} PRIVATE LIBDB_NVM_FLUSH_HIGH_BYTES=65536 LIBDB_NVM_FLUSH_LOW_BYTES=32768)
+        target_include_directories(${merge_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(${merge_target} PRIVATE -fcommon -ffunction-sections -fdata-sections -UNDEBUG)
+        target_link_options(${merge_target} PRIVATE -Wl,--gc-sections
+            -Wl,--wrap=nvm_index_get_free_node -Wl,--wrap=nvm_index_reserve_free_nodes
+            -Wl,--wrap=nvm_index_commit_slot_updates -Wl,--wrap=malloc -Wl,--wrap=kvcache_delete)
+        target_link_libraries(${merge_target} PRIVATE pmemobj pmem pthread m)
+        if(LIBDB_TEST_SANITIZERS)
+            target_compile_options(${merge_target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+            target_link_options(${merge_target} PRIVATE -fsanitize=address,undefined)
+        endif()
+        if(merge_target STREQUAL "merge_off_test")
+            target_compile_definitions(${merge_target} PRIVATE LIBDB_DYNAMIC_FLUSH_ENABLED=0)
+        endif()
+    endforeach()
     # Same GC/IO harness with the real WBF allocator, small file quota and recovery.
     add_executable(gc_tail_wbf_test tests/gc_tail_wbf_test.c space_stats.c dram_index.c subspace.c
         write_buffer_index.c kvcache.c nvm_index.c merge_flush.c task.c get.c
@@ -146,7 +171,7 @@ if(BUILD_TESTING)
     target_compile_options(gc_tail_wbf_test PRIVATE -fcommon -ffunction-sections -fdata-sections -UNDEBUG)
     target_link_options(gc_tail_wbf_test PRIVATE -Wl,--gc-sections
         -Wl,--wrap=nvm_index_get_free_node -Wl,--wrap=nvm_index_reserve_free_nodes
-        -Wl,--wrap=nvm_index_commit_slot_updates)
+        -Wl,--wrap=nvm_index_commit_slot_updates -Wl,--wrap=malloc -Wl,--wrap=kvcache_delete)
     target_link_libraries(gc_tail_wbf_test PRIVATE pmemobj pmem pthread m)
     if(LIBDB_TEST_SANITIZERS)
         target_compile_options(gc_tail_wbf_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
@@ -183,5 +208,6 @@ if(BUILD_TESTING)
     add_test(NAME allocator COMMAND allocator_test)
     set_tests_properties(allocator PROPERTIES TIMEOUT 10)
     add_test(NAME merge COMMAND merge_test)
-    set_tests_properties(merge PROPERTIES TIMEOUT 90)
+    add_test(NAME merge_off COMMAND merge_off_test)
+    set_tests_properties(merge merge_off PROPERTIES TIMEOUT 90)
 endif()

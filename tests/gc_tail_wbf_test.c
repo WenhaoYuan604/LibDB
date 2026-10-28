@@ -25,7 +25,7 @@ static void gc_real_restart_test(void){
     CHECK(recovery_rebuild_write_buffer_indices(&database));
     CHECK(recovery_verify_post(&database));
     a = dram_index_search(hybrid.dram_index, 5, NULL, NULL);
-    CHECK(a && a->boundary == 0 && a->key_num == 4 && a->buffered_size == 2048);
+    CHECK(a && a->boundary == 0 && a->key_num == 4 && a->slot_num == 4 && a->buffered_size == 2048);
     for(int k = 1; k <= 6; k++) check_get(k, 'a');
     struct write_buffer_index_node *n = write_buffer_index_search(a->buffer_index, 5);
     struct kv_record_view view;

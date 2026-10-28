@@ -100,11 +100,10 @@ int server_executor(void * arg){
             }
         }
         /* Normal results have been consumed before stop is requested.
-         * Drain submitted I/O and scheduled maintenance, without forcing
+         * Drain submitted I/O and pending merges, without forcing
          * buffered data below the normal flush threshold onto SSD. */
         if(benchmark_completed && !req_num && !thread->maintenance && tasks_idle(thread))
             break;
     }
-    maintenance_clear_deferred(thread);
     return 0;
 }//server_excutor

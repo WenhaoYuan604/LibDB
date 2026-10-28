@@ -14,6 +14,7 @@
 #include "spdk/env.h"
 
 struct db{
+    const char *benchmark_phase;
     struct initial_load_stats initial_load;
     struct gc_space_control gc_space;
     struct nvm_flush_control nvm_flush;
@@ -62,6 +63,7 @@ struct thread * initialize(struct db * db);
 struct thread * initialize_recovery(struct db * db);
 
 
+/* Write path only: busy groups skip; task exhaustion polls existing I/O. */
 bool subspace_maybe_flush(struct subspace_info *group, struct thread *thread);
 
 void insert(key_type key , int size , char * value ,  struct thread * thread , struct insert_time_breakdown * break_down);

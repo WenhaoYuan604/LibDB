@@ -5,6 +5,8 @@
 #include "subspace.h"
 #include <spdk/env.h>
 #include <spdk/event.h>
+#include <errno.h>
+#include <sched.h>
 #include <stdint.h>
 #include "pthread.h"
 #include "hist.h"
@@ -420,6 +422,39 @@ void load_executor(void * arg){
     pthread_barrier_wait(&barrier_complete);
 }
 
+/* Lifetime completion counters avoid resetting statistics under running workers. */
+static void snapshot_ssd_writes(struct db *db, uint64_t bytes[SSD_WRITE_KINDS])
+{
+    memset(bytes, 0, sizeof(uint64_t) * SSD_WRITE_KINDS);
+    for (int worker = 0; worker < db->thread; worker++)
+        for (int kind = 0; kind < SSD_WRITE_KINDS; kind++)
+            bytes[kind] += atomic_load_explicit(
+                &db->workers[worker].ssd_writes.bytes[kind], memory_order_relaxed);
+}
+
+static void report_ssd_window(struct db *db, int count, double seconds,
+                              const uint64_t *before, const uint64_t *after)
+{
+    if (!db->benchmark_phase ||
+        (strcmp(db->benchmark_phase, "precondition") &&
+         strcmp(db->benchmark_phase, "measured"))) return;
+    char line[1024];
+    snprintf(line, sizeof(line),
+        "SSD window: {\"phase\":\"%s\",\"requests\":%d,"
+        "\"inserts\":%d,\"updates\":%d,\"reads\":%d,\"scans\":%d,"
+        "\"kv_size_bytes\":%d,\"seconds\":%.9f,"
+        "\"flush_bytes\":%llu,\"gc_bytes\":%llu,"
+        "\"split_bytes\":%llu,\"merge_bytes\":%llu}\n",
+        db->benchmark_phase, count, test_insert_num, test_update_num,
+        test_get_num, test_scan_num, db->size_kv, seconds,
+        (unsigned long long)(after[SSD_WRITE_FLUSH] - before[SSD_WRITE_FLUSH]),
+        (unsigned long long)(after[SSD_WRITE_GC] - before[SSD_WRITE_GC]),
+        (unsigned long long)(after[SSD_WRITE_SPLIT] - before[SSD_WRITE_SPLIT]),
+        (unsigned long long)(after[SSD_WRITE_MERGE] - before[SSD_WRITE_MERGE]));
+    fputs(line, stdout);
+    if (db->output_fp && db->output_fp != stdout) fputs(line, db->output_fp);
+}
+
 bool client_initialize_load_injectors(struct db * db , struct user_rq * load, int load_num){
     if(!db || !load || load_num <= 0 || db->load_injectors <= 0) return false;
     uint64_t ticks = spdk_get_ticks_hz() ;
@@ -444,7 +479,16 @@ bool client_initialize_load_injectors(struct db * db , struct user_rq * load, in
         load_injectors[i].nb_load_injectors = db->load_injectors;
         printf("start load thread %d core %d(numa node %d)\n" , i , load_injectors[i].core,spdk_env_get_socket_id(load_injectors[i].core));
         fflush(stdout);
-        if(spdk_env_thread_launch_pinned(load_injectors[i].core , (thread_start_fn)load_executor , &load_injectors[i])){
+        /* A previous phase can have crossed its final barrier while its
+         * injector core is still returning to SPDK's idle state. */
+        int launch_rc;
+        const uint64_t launch_deadline = spdk_get_ticks() + ticks;
+        do {
+            launch_rc = spdk_env_thread_launch_pinned(load_injectors[i].core,
+                (thread_start_fn)load_executor, &load_injectors[i]);
+            if (launch_rc == -EBUSY) sched_yield();
+        } while (launch_rc == -EBUSY && spdk_get_ticks() < launch_deadline);
+        if(launch_rc){
             printf("failed to start load thread %d\n" , i);
 			return false;
         }
@@ -454,15 +498,20 @@ bool client_initialize_load_injectors(struct db * db , struct user_rq * load, in
         fflush(stdout);
     }
 
-    pthread_barrier_wait(&barrier);
+    uint64_t writes_before[SSD_WRITE_KINDS], writes_after[SSD_WRITE_KINDS];
+    snapshot_ssd_writes(db, writes_before);
     start = spdk_get_ticks();
+    /* Start before releasing injectors: no foreground request escapes timing. */
+    pthread_barrier_wait(&barrier);
     client_polling_completed(db , load_num);
+    end = spdk_get_ticks();
+    snapshot_ssd_writes(db, writes_after);
     pthread_barrier_wait(&barrier_complete);
     pthread_barrier_destroy(&barrier);
     pthread_barrier_destroy(&barrier_complete);
-    end = spdk_get_ticks();
     printf("load done\n");
     time = (double)(end - start) / ticks;
+    report_ssd_window(db, load_num, time, writes_before, writes_after);
     printf("%d ops , time is %lf , throughput is %lf\n" , load_num , time , load_num / time);
     fflush(stdout);
     client_output_bw(db);
@@ -479,95 +528,7 @@ bool client_initialize_load_injectors(struct db * db , struct user_rq * load, in
 }
 
 
-static struct db *client_monitor_db;
-
-void client_executor(struct db * db){
-    client_monitor_db = db;
-
-
-    struct user_rq * warm = NULL;
-    int warm_num = 0;
-    struct user_rq * test;
-    int test_num;
-    int cache_key_num = 0;
-
-    /*读取文件warm.txt和test.txt中的数据*/
-
-    int is_production = 0;
-    if (strstr(g_libdb_config.test_path, "Production") != NULL) {
-        is_production = 1;
-    }
-
-    if (is_production) {
-        warm = client_read_production_request(g_libdb_config.warm_path , &warm_num);
-        cache_key_num = warm_num * 1 / 10;
-    } else {
-        warm = client_read_request(g_libdb_config.warm_path , &warm_num , db->size_value);
-        cache_key_num = warm_num * 5 / 10;
-    }
-    if (warm == NULL || warm_num == 0) {
-        fprintf(stderr, "failed to load warm workload: %s\n", g_libdb_config.warm_path);
-        benchmark_completed = 1;
-        client_monitor_db = NULL;
-        return;
-    }
-
-    /* recovery：数据已在 NVM，跳过整批 load；仍读 warm 并做 cache 预热（末尾改读） */
-    if (!db->recovery_mode) {
-        printf("start to load\n");
-        fflush(stdout);
-        db->initial_load.complete = client_initialize_load_injectors(db ,warm, warm_num);
-        if(!db->initial_load.complete) {
-            fprintf(stderr, "initial load failed; stopping benchmark\n");
-            exit(EXIT_FAILURE);
-        }
-        if(db->initial_load.complete)
-            db->initial_load.error = space_stats_load_bytes(warm, warm_num, &db->initial_load.record_bytes);
-        space_stats_gc_poll(db);
-        space_stats_gc_wait(db, 10);
-    } else {
-        printf("recovery mode: skip load, keep cache warmup\n");
-        fflush(stdout);
-    }
-
-    /*预热cache*/
-    for(int i = warm_num - cache_key_num ; i < warm_num ; i++){
-        warm[i].type = 0;
-    }
-    if (cache_key_num > 0) {
-        if(!client_initialize_load_injectors(db ,&warm[warm_num - cache_key_num], cache_key_num))
-            exit(EXIT_FAILURE);
-    }
-
-    space_stats_gc_wait(db, 10);
-    test_get_num = 0;
-    test_insert_num = 0;
-    test_update_num = 0;
-    test_scan_num = 0;
-    if (is_production) {
-        test = client_read_production_request(g_libdb_config.test_path , &test_num);
-    } else {
-        test = client_read_request(g_libdb_config.test_path , &test_num , db->size_value);
-    }
-    if (test == NULL || test_num == 0) {
-        fprintf(stderr, "failed to load test workload: %s\n", g_libdb_config.test_path);
-    } else {
-        space_stats_nvm_start(db);
-        if(!client_initialize_load_injectors(db ,test, test_num))
-            exit(EXIT_FAILURE);
-        space_stats_nvm_stop(db);
-        free(test);
-    }
-    fflush(stdout);
-    fflush(db->output_fp);
-
-
-    benchmark_completed = 1;
-
-    client_monitor_db = NULL;
-}
-
-
+struct db *client_monitor_db;
 
 struct user_rq * client_read_request(char * file  , int * num , int kvsize){
     FILE * fp;

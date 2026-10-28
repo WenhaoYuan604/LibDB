@@ -23,7 +23,12 @@
 #define LIBDB_TASK_BUFFER_BLOCK_COUNT            256U
 
 /* Flush, subspace, slot, and free-space group layout. */
+#ifndef LIBDB_FLUSH_BLOCK_COUNT
 #define LIBDB_FLUSH_BLOCK_COUNT                 4
+#endif
+#if LIBDB_FLUSH_BLOCK_COUNT <= 0
+#error "LIBDB_FLUSH_BLOCK_COUNT must be a positive integer"
+#endif
 #define LIBDB_LNF_SLOT_SIZE                     256U
 #ifndef LIBDB_SUBSPACE_MAX_KEYS
 #define LIBDB_SUBSPACE_MAX_KEYS                 128U
@@ -122,6 +127,7 @@ struct libdb_runtime_config {
     char pci_addr[LIBDB_PCI_ADDR_CAPACITY];
     char pmem_dir[LIBDB_PATH_CAPACITY];
     char warm_path[LIBDB_PATH_CAPACITY];
+    char precondition_path[LIBDB_PATH_CAPACITY];
     char test_path[LIBDB_PATH_CAPACITY];
 };
 
@@ -131,6 +137,7 @@ int libdb_config_init_from_env(void);
 int libdb_config_set_pci_addr(const char *value);
 int libdb_config_set_pmem_dir(const char *value);
 int libdb_config_set_warm_path(const char *value);
+int libdb_config_set_precondition_path(const char *value);
 int libdb_config_set_test_path(const char *value);
 int libdb_config_validate(char *error, size_t error_size);
 void libdb_config_print(FILE *stream);

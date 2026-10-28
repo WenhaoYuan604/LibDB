@@ -201,12 +201,12 @@ class DynamicFlushRunnerTest(unittest.TestCase):
             if proc.poll() is None: proc.terminate(); proc.communicate(timeout=5)
             proc.stdout.close()
 
-    def test_source_default_is_off_then_on(self):
+    def test_source_default_is_on_then_off(self):
         env = dict(self.env)
         env.pop('LIBDB_DYNAMIC_FLUSH_MODES')
         result = subprocess.run([str(SCRIPT)], env=env, capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([row['mode'] for row in self.rows()], ['off', 'on'])
+        self.assertEqual([row['mode'] for row in self.rows()], ['on', 'off'])
         self.clean()
 
     def test_single_on_mode(self):
@@ -326,7 +326,7 @@ class DynamicFlushRunnerTest(unittest.TestCase):
     def test_help_does_not_require_devices_or_inputs(self):
         result = subprocess.run([str(SCRIPT), '--help'], capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0)
-        self.assertIn('source MODES setting (OFF then ON)', result.stdout)
+        self.assertIn('source MODES setting (ON then OFF)', result.stdout)
         self.assertFalse(self.result.exists())
 
 

@@ -44,6 +44,7 @@ static void print_usage(FILE *stream, const char *program)
         "  --load-injectors=N       Client injector count (default %d)\n"
         "  --tasks-per-thread=N     Outstanding tasks per worker (default %d)\n"
         "  --boundary-size=N        Initial boundary sample size (default %d)\n"
+        "  --precondition=FILE      Run YCSB A after cache warmup, before test\n"
         "  --output=FILE            Append statistics to FILE\n"
         "  --recovery[=0|1]         Rebuild indexes from persistent data\n"
         "  --recovery-dupcheck=0|1  Check duplicate keys after recovery\n"
@@ -147,6 +148,11 @@ void parse_arg (int argc , char ** argv , struct db * db){
         } else if (strcmp(key, "warm") == 0) {
             if (libdb_config_set_warm_path(unquote(value)) != 0) {
                 fprintf(stderr, "warm workload 路径过长\n");
+                exit(EXIT_FAILURE);
+            }
+        } else if (strcmp(key, "precondition") == 0) {
+            if (libdb_config_set_precondition_path(unquote(value)) != 0) {
+                fprintf(stderr, "precondition workload path too long\n");
                 exit(EXIT_FAILURE);
             }
         } else if (strcmp(key, "test") == 0) {
