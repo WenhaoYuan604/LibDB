@@ -1,0 +1,31 @@
+# build & cache
+build/
+__pycache__/
+results/
+compile_commands.json
+
+# IDE
+.vscode/
+.idea/
+
+# logs
+*.log
+
+# experiment results
+ExperimentResult*/
+RESULT_*.txt
+RESULT_*/
+
+# temp / misc
+*.out
+*.tmp
+*.orig
+core
+core.*
+
+# OS
+.DS_Store
+workloads_unif/
+workloads_zipf/
+warm.txt
+nutanix.txt

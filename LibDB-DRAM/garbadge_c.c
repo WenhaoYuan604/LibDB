@@ -1,0 +1,504 @@
+#include "wal.h"
+#include "space_stats.h"
+#include "./garbadge_c.h"
+#include "merge_flush.h"
+#include "kv_record.h"
+#include "dram_index.h"
+#include "slot_index.h"
+#include "spdk_struct.h"
+#include "subspace.h"
+#include "kvbuffer.h"
+#include "write_buffer_index.h"
+#include <stdint.h>
+int block_exist(uint32_t block ,uint32_t * block_array ,int block_array_size_tmp){
+    for (int i = 0; i < block_array_size_tmp; i++)
+        if (block_array[i] == block)
+            return i+1;
+    return 0;
+}
+
+static int __redundant_comp(const void * a, const void * b) {
+    return ((struct redundant_element *)b)->block_redundant_size - ((struct redundant_element *)a)->block_redundant_size;
+}
+
+static int redundant_element_upper_bound(uint32_t block,
+    struct redundant_element *redundant_array, int size) {
+    int l = 0, r = size;
+    while (l < r) {
+        int m = (l + r) / 2;
+        if (redundant_array[m].block < block)
+            l = m + 1;
+        else
+            r = m;
+    }
+    return l;
+}
+
+static struct redundant_element * redundant_element_find(uint32_t block,
+    struct redundant_element *redundant_array, int size) {
+    int pos = redundant_element_upper_bound(block, redundant_array, size);
+    if (!(pos < size && redundant_array[pos].block == block)) {
+        memmove(redundant_array + pos + 1, redundant_array + pos, sizeof(struct redundant_element) * (size - pos));
+        redundant_array[pos].block = block;
+        redundant_array[pos].block_redundant_size = BLOCK_SIZE;
+    }
+    return redundant_array + pos;
+}
+
+
+
+
+#define GC_MAX_ENTRIES (SUBSPACE_MAX_SLOT * SLOT_MAX_ELEMENT)
+struct gc_entry {
+    struct slot_element item;
+    int packed_block;
+    uint32_t source_slot;
+};
+struct gc_plan {
+
+    struct slot_element old[GC_MAX_ENTRIES];
+    struct gc_entry entries[GC_MAX_ENTRIES];
+    uint32_t old_count, count, slot_count, update_count;
+    struct slot_update updates[2 * SUBSPACE_MAX_SLOT];
+    bool dirty[SUBSPACE_MAX_SLOT];
+    struct index_slot *slots[SUBSPACE_MAX_SLOT], *retired[SUBSPACE_MAX_SLOT];
+    uint8_t slot_keys[SUBSPACE_MAX_SLOT];
+    key_type min_keys[SUBSPACE_MAX_SLOT];
+    uint32_t retired_count;
+    struct write_buffer_index *frozen;
+    bool returned_tail;
+    uint32_t destinations[LIBDB_TASK_BUFFER_BLOCK_COUNT];
+    uint32_t write_count;
+};
+
+static void gc_fatal(const char *reason){
+    fprintf(stderr, "GC: %s; source blocks retained\n", reason);
+    exit(EXIT_FAILURE);
+}
+
+
+static uint32_t gc_key_slot(const struct subspace_info *group, key_type key){
+    uint32_t slot = 0;
+    while(slot + 1 < group->slot_num && key >= group->min_key[slot + 1]) slot++;
+    return slot;
+}
+
+
+
+static size_t gc_fill_prefix_count(struct gc_plan *plan,
+                                  struct subspace_info *group, size_t needed){
+    size_t bytes = 0, keys = 0, projected = plan->count;
+    uint32_t slot_keys[SUBSPACE_MAX_SLOT];
+    for(uint32_t i = 0; i < group->slot_num; i++) slot_keys[i] = group->slot_key_num[i];
+    for(struct write_buffer_index_node *n = group->buffer_index->head->forward[0];
+        n && bytes < needed; n = n->forward[0]){
+        if(n->size > needed - bytes) return 0;
+        struct kv_record_view view;
+        if(kv_record_decode_for_key(n->record, n->size, n->key, &view) ||
+           view.record_size != n->size) gc_fatal("invalid DRAM fill record");
+        bool exists = false;
+        for(uint32_t i = 0; i < plan->count; i++)
+            if(plan->entries[i].item.key == n->key) { exists = true; break; }
+        if(!exists){
+            projected++;
+            slot_keys[gc_key_slot(group, n->key)]++;
+        }
+        if(projected > SUBSPACE_MAX_KEY || projected > GC_MAX_ENTRIES) return 0;
+        bytes += n->size;
+        keys++;
+    }
+    uint32_t slots = 0;
+    for(uint32_t i = 0; i < group->slot_num; i++)
+        slots += (slot_keys[i] + SLOT_MAX_ELEMENT - 1) / SLOT_MAX_ELEMENT;
+    return bytes == needed && slots <= SUBSPACE_MAX_SLOT ? keys : 0;
+}
+
+static void gc_return_record(struct thread *thread, struct subspace_info *group,
+                             const struct slot_element *entry, const char *record){
+    struct kv_record_view view;
+    if(kv_record_decode_for_key(record, entry->addr.size, entry->key, &view) ||
+       view.record_size != entry->addr.size) gc_fatal("invalid SSD tail record");
+    for(struct write_buffer_index *b = group->buffer_index; b; b = b->next){
+        struct write_buffer_index_node *n = write_buffer_index_search(b, entry->key);
+        if(!n) continue;
+        struct kv_record_view current;
+        if(kv_record_decode_for_key(n->record, n->size, n->key, &current))
+            gc_fatal("invalid existing DRAM record");
+        if(current.version >= view.version) return;
+    }
+
+
+    char *record_copy = write_buffer_insert(view.key, view.version, view.value,
+        view.value_size, &thread->kvbuffer);
+    if(!record_copy) gc_fatal("cannot allocate tail in DRAM");
+    struct write_buffer_return_type old = slot_index_insert(group, record_copy,
+        view.key, view.record_size, thread->thread);
+    if(old.size) write_buffer_free(old.record, old.size, &thread->kvbuffer);
+}
+
+
+
+
+static void gc_stage_slots(struct gc_plan *plan, struct subspace_info *group,
+                           struct thread *thread){
+    uint32_t counts[SUBSPACE_MAX_SLOT] = {0};
+    for(uint32_t i = 0; i < plan->count; i++) counts[plan->entries[i].source_slot]++;
+    uint32_t at = 0;
+    for(uint32_t i = 0; i < group->slot_num; i++){
+        if(!plan->dirty[i]){
+            uint32_t out = plan->slot_count++;
+            plan->slots[out] = group->slot[i];
+            plan->slot_keys[out] = group->slot_key_num[i];
+            plan->min_keys[out] = group->min_key[i];
+            at += counts[i];
+            continue;
+        }
+        if(!counts[i]){
+
+            plan->updates[plan->update_count++].slot = group->slot[i];
+            plan->retired[plan->retired_count++] = group->slot[i];
+            continue;
+        }
+        uint32_t remaining = counts[i];
+        uint32_t parts = (remaining + SLOT_MAX_ELEMENT - 1) / SLOT_MAX_ELEMENT;
+        bool first = true;
+        while(parts){
+            if(plan->slot_count == SUBSPACE_MAX_SLOT) gc_fatal("output index exceeds slot capacity");
+            uint32_t n = remaining / parts;
+            struct index_slot *id = first ? group->slot[i] : slot_index_allocate(&thread->slots);
+            if(!id) gc_fatal("cannot allocate output slot");
+            struct slot_update *update = &plan->updates[plan->update_count++];
+            update->slot = id;
+            update->image.boundary = group->boundary;
+            for(uint32_t j = 0; j < n; j++){
+                if(at >= plan->count || plan->entries[at].source_slot != i)
+                    gc_fatal("invalid slot-local record order");
+                update->image.entries[j] = plan->entries[at++].item;
+            }
+            uint32_t out = plan->slot_count++;
+            plan->slots[out] = id;
+            plan->slot_keys[out] = n;
+            plan->min_keys[out] = update->image.entries[0].key;
+            remaining -= n;
+            parts--;
+            first = false;
+        }
+    }
+}
+
+static struct gc_plan *gc_stage(struct task *task){
+    struct thread *thread = task->thread;
+    struct subspace_info *group = task->subspace_info;
+    struct gc_plan *plan = calloc(1, sizeof(*plan));
+    const size_t packed_blocks = task->total_block_num;
+    if(!packed_blocks || packed_blocks > LIBDB_TASK_BUFFER_BLOCK_COUNT)
+        gc_fatal("invalid staging block count");
+    char *packed = malloc(packed_blocks * BLOCK_SIZE);
+    if(!plan || !packed) gc_fatal("cannot allocate staging buffers");
+    int block = 0;
+    size_t off = 0;
+    for(uint32_t i = 0; i < group->slot_num; i++){
+        struct slot_element *entries = subspace_slot_elements(group, i);
+        if(!entries || group->slot_key_num[i] > SLOT_MAX_ELEMENT)
+            gc_fatal("invalid source slot");
+        for(uint32_t j = 0; j < group->slot_key_num[i]; j++){
+            if(plan->count == GC_MAX_ENTRIES) gc_fatal("source index too large");
+            struct gc_entry *e = &plan->entries[plan->count++];
+            e->item = entries[j];
+            e->packed_block = -1;
+            e->source_slot = i;
+            int source = block_exist(e->item.addr.block, task->block_array, task->total_block_num);
+            if(!source) continue;
+            plan->old[plan->old_count++] = e->item;
+            plan->dirty[i] = true;
+            struct kv_record_view view;
+            size_t size = e->item.addr.size;
+            if(size > BLOCK_SIZE || e->item.addr.off + size > BLOCK_SIZE)
+                gc_fatal("record crosses source block");
+            const char *record = task->buffer + (size_t)(source - 1) * BLOCK_SIZE + e->item.addr.off;
+            if(kv_record_decode_for_key(record, size, e->item.key, &view) || view.record_size != size)
+                gc_fatal("invalid SSD record");
+            if(off + size > BLOCK_SIZE){
+                memset(packed + (size_t)block * BLOCK_SIZE + off, 0, BLOCK_SIZE - off);
+                block++; off = 0;
+            }
+            if((size_t)block >= packed_blocks) gc_fatal("packed output exceeds staging buffer");
+            memcpy(packed + (size_t)block * BLOCK_SIZE + off, record, size);
+            e->packed_block = block;
+            e->item.addr.off = off;
+            off += size;
+        }
+    }
+    if(!off) gc_fatal("empty GC selection");
+    if(block > 0 && off < BLOCK_SIZE){
+        size_t needed = BLOCK_SIZE - off;
+        size_t keys = gc_fill_prefix_count(plan, group, needed);
+        if(keys){
+            plan->frozen = write_buffer_index_take_prefix(group->buffer_index, keys, needed);
+            if(!plan->frozen) gc_fatal("cannot freeze DRAM fill prefix");
+            plan->frozen->next = group->buffer_index->next;
+            if(plan->frozen->next) plan->frozen->next->prev = plan->frozen;
+            plan->frozen->prev = group->buffer_index;
+            group->buffer_index->next = plan->frozen;
+            for(struct write_buffer_index_node *n = plan->frozen->head->forward[0]; n; n = n->forward[0]){
+                uint32_t i = 0;
+                while(i < plan->count && plan->entries[i].item.key < n->key) i++;
+                if(i == plan->count || plan->entries[i].item.key != n->key){
+                    memmove(plan->entries + i + 1, plan->entries + i,
+                            (plan->count - i) * sizeof(*plan->entries));
+                    plan->count++;
+                    plan->entries[i].source_slot = gc_key_slot(group, n->key);
+                } else if(plan->entries[i].packed_block < 0){
+
+
+                    plan->old[plan->old_count++] = plan->entries[i].item;
+                }
+                if((size_t)block >= packed_blocks || n->size > BLOCK_SIZE - off)
+                    gc_fatal("DRAM fill exceeds staging buffer");
+                struct gc_entry *e = &plan->entries[i];
+                plan->dirty[e->source_slot] = true;
+                e->item = (struct slot_element){.key = n->key,
+                    .addr = {.off = off, .size = n->size}};
+                e->packed_block = block;
+                memcpy(packed + (size_t)block * BLOCK_SIZE + off, n->record, n->size);
+                off += n->size;
+                group->buffered_size -= n->size;
+            }
+            if(off != BLOCK_SIZE) gc_fatal("incomplete DRAM fill prefix");
+        } else {
+            plan->returned_tail = true;
+            uint32_t kept = 0;
+            for(uint32_t i = 0; i < plan->count; i++){
+                struct gc_entry *e = &plan->entries[i];
+                if(e->packed_block == block)
+                    gc_return_record(thread, group, &e->item,
+                        packed + (size_t)block * BLOCK_SIZE + e->item.addr.off);
+                else plan->entries[kept++] = *e;
+            }
+            plan->count = kept;
+        }
+    }
+    memset(packed + (size_t)block * BLOCK_SIZE + off, 0, BLOCK_SIZE - off);
+
+
+
+    for(int b = 0; b <= block; b++){
+        bool used = false;
+        for(uint32_t i = 0; i < plan->count; i++)
+            if(plan->entries[i].packed_block == b) { used = true; break; }
+        if(!used) continue;
+        int dest = get_free_block(&thread->curr_segment, thread->fs);
+        if(dest < 0) gc_fatal("out of SSD space");
+        plan->destinations[plan->write_count] = dest;
+        memcpy(task->buffer + (size_t)plan->write_count++ * BLOCK_SIZE,
+               packed + (size_t)b * BLOCK_SIZE, BLOCK_SIZE);
+        for(uint32_t i = 0; i < plan->count; i++){
+            if(plan->entries[i].packed_block == b){
+                struct slot_element *e = &plan->entries[i].item;
+                e->addr.block = dest;
+            }
+        }
+    }
+    free(packed);
+    gc_stage_slots(plan, group, thread);
+    return plan;
+}
+
+static void gc_commit(struct task *task){
+    struct thread *thread = task->thread;
+    struct subspace_info *group = task->subspace_info;
+    struct gc_plan *plan = task->gc_plan;
+    if(slot_index_apply_updates(plan->updates, plan->update_count))
+        gc_fatal("slot commit failed");
+    for(uint32_t i = 0; i < plan->old_count; i++)
+        block_ref_remove(plan->old[i].addr.block);
+    uint32_t blocks[GC_MAX_ENTRIES], count = 0;
+    uint64_t bytes = 0;
+    for(uint32_t i = 0; i < plan->count; i++){
+        struct slot_element *e = &plan->entries[i].item;
+        if(plan->entries[i].packed_block >= 0) block_ref_add(e->addr.block);
+        if(!block_exist(e->addr.block, blocks, count)) blocks[count++] = e->addr.block;
+        bytes += e->addr.size;
+    }
+    group->total_block_num = count;
+    group->redundant_size = (uint64_t)count * BLOCK_SIZE - bytes;
+    group->key_num = plan->count;
+    uint32_t old_slots = group->slot_num;
+    for(uint32_t i = 0; i < plan->retired_count; i++)
+        slot_index_free(&thread->slots, plan->retired[i]);
+    group->slot_num = plan->slot_count;
+    for(uint32_t i = 0; i < plan->slot_count; i++){
+        group->slot[i] = plan->slots[i];
+        group->slot_key_num[i] = plan->slot_keys[i];
+        group->min_key[i] = plan->min_keys[i];
+    }
+    for(uint32_t i = plan->slot_count; i < old_slots; i++){
+        group->slot[i] = NULL;
+        group->slot_key_num[i] = 0;
+        group->min_key[i] = 0;
+    }
+    if(plan->frozen){
+        struct write_buffer_index *batch = plan->frozen;
+
+
+        for(struct write_buffer_index_node *n = batch->head->forward[0]; n; n = n->forward[0])
+            kvcache_delete(group->kvcache, thread->lru_list, n->key);
+        batch->prev->next = batch->next;
+        if(batch->next) batch->next->prev = batch->prev;
+        for(struct write_buffer_index_node *n = batch->head->forward[0]; n; n = n->forward[0]){
+            wal_release_dependencies(n);
+            write_buffer_free(n->record, n->size, &thread->kvbuffer);
+        }
+        write_buffer_index_destroy(batch);
+    }
+
+
+    count = 0;
+    for(uint32_t i = 0; i < plan->old_count; i++){
+        uint32_t b = plan->old[i].addr.block;
+        if(!g_map[b] && !block_exist(b, blocks, count)) blocks[count++] = b;
+    }
+    reclaim_blocks(thread, blocks, count);
+    group->is_gc = false;
+    free(task->block_array);
+    free(plan);
+    task->gc_plan = NULL;
+    free_task(task);
+}
+
+static void garbadge_collection_cb_write_cb(void *arg, const struct spdk_nvme_cpl *cpl){
+    struct task *task = arg;
+    struct thread *thread = task->thread;
+    uint64_t start = spdk_get_ticks();
+    if(spdk_nvme_cpl_is_error(cpl)) task->gc_io_failed = 1;
+    if(++task->block_completed == task->total_block_num){
+        if(task->gc_io_failed) gc_fatal("SSD write completion failed");
+        gc_commit(task);
+    }
+    insert_breakdown[thread->thread].gc_cb_time += spdk_get_ticks() - start;
+}
+
+static void garbadge_collection_cb(void *arg, const struct spdk_nvme_cpl *cpl){
+    struct task *task = arg;
+    struct thread *thread = task->thread;
+    struct ns_entry *ns = thread->ns_entry;
+    uint64_t start = spdk_get_ticks();
+    if(spdk_nvme_cpl_is_error(cpl)) task->gc_io_failed = 1;
+    if(++task->block_completed == task->total_block_num){
+        if(task->gc_io_failed) gc_fatal("SSD read completion failed");
+        struct gc_plan *plan = gc_stage(task);
+        task->gc_plan = plan;
+        task->total_block_num = plan->write_count;
+        task->block_completed = 0;
+        if(!plan->write_count) gc_commit(task);
+        else for(uint32_t i = 0; i < plan->write_count; i++){
+            thread_block_rw[thread->thread]++;
+            thread_gc_block_rw[thread->thread]++;
+            thread_gc_block_write[thread->thread]++;
+            if(spdk_nvme_ns_cmd_write(ns->ns, ns->qpair[thread->thread % ctr_max_qp],
+                task->buffer + (size_t)i * BLOCK_SIZE,
+                (uint64_t)plan->destinations[i] * physical_block_to_logical_block,
+                physical_block_to_logical_block, garbadge_collection_cb_write_cb, task,
+                0)) gc_fatal("SSD write submission failed");
+            phase_io_add(&thread->phase_io, PHASE_GC, 1);
+        }
+    }
+    insert_breakdown[thread->thread].gc_cb_time += spdk_get_ticks() - start;
+}
+
+static uint32_t * block_redundant_compute_fraction(struct subspace_info * subspace_info , int * array_size ,struct thread * thread, double fraction){
+    struct redundant_element *redundant_array = calloc(GC_MAX_ENTRIES, sizeof(*redundant_array));
+    if(!redundant_array) gc_fatal("cannot allocate GC candidates");
+    int size = 0;
+    int j = 0;
+    for (int i = 0; i < subspace_info->slot_num; i++) {
+        struct slot_element *slot_elements =
+            subspace_slot_elements(subspace_info, (uint32_t)i);
+        for (int j = 0; j < subspace_info->slot_key_num[i]; j++) {
+            struct address_type *addr = &slot_elements[j].addr;
+            struct redundant_element * redundant_element = redundant_element_find(addr->block, redundant_array, size);
+            if (redundant_element->block_redundant_size == BLOCK_SIZE)
+                size++;
+            redundant_element->block_redundant_size -= addr->size;
+        }
+    }
+
+    if (subspace_info->total_block_num > size) {
+        invalid_block_num[thread->thread] += subspace_info->total_block_num - size;
+
+    }
+
+    qsort(redundant_array, size, sizeof(struct redundant_element), __redundant_comp);
+    uint32_t *arr = malloc(sizeof(*arr) * (size ? size : 1));
+    if(!arr) gc_fatal("cannot allocate GC selection");
+    subspace_info->redundant_size = 0;
+    for (int i = 0; i < size; i++) {
+        if(redundant_array[i].block_redundant_size >= BLOCK_SIZE * fraction){
+            arr[j] = redundant_array[i].block;
+            j++;
+        }
+        else{
+            subspace_info->redundant_size += redundant_array[i].block_redundant_size;
+        }
+    }
+    free(redundant_array);
+    *array_size = j;
+    return arr;
+}
+
+uint32_t *block_redundant_compute(struct subspace_info *group, int *count, struct thread *thread) {
+    return block_redundant_compute_fraction(group, count, thread, space_stats_gc_fraction(thread->db));
+}
+void garbadge_collection(struct subspace_info *group, struct thread *thread) {
+    garbadge_collection_with_fraction(group, thread, space_stats_gc_fraction(thread->db));
+}
+void garbadge_collection_with_fraction(struct subspace_info * subspace_info ,struct thread * thread, double fraction){
+    if(subspace_info->is_merging || subspace_info->is_spliting || subspace_info->flush_block_num) return;
+
+    struct ns_entry * ns_entry = (struct ns_entry * )thread->ns_entry;
+    uint32_t * redundant_array;
+    int redundant_array_size;
+    struct task * task;
+    int qpair_excuting_once , rc;
+    int qpair_num = thread->thread % ctr_max_qp;
+
+
+    redundant_array = block_redundant_compute_fraction(subspace_info , &redundant_array_size , thread, fraction);
+    if(redundant_array_size == 0){
+        free(redundant_array);
+        subspace_info->is_gc = false;
+        return;
+    }
+    task = get_free_task(ns_entry , thread->thread);
+    while(task == NULL){
+        if((qpair_excuting_once = spdk_nvme_qpair_process_completions(
+                ns_entry->qpair[qpair_num], 0)) < 0){
+                printf("ERROR:fail to process_completions qpair[%d]\n" , qpair_num);
+                return;
+        }
+        if(qpair_excuting_once != 0){
+            task = get_free_task(ns_entry , thread->thread);
+        }
+    }
+    task->subspace_info = subspace_info;
+    task->thread = thread;
+    task->block_completed = 0;
+    task->gc_plan = NULL;
+    task->gc_io_failed = 0;
+    if(redundant_array_size > LIBDB_TASK_BUFFER_BLOCK_COUNT) gc_fatal("selection exceeds DMA buffer");
+    task->total_block_num = redundant_array_size;
+    task->block_array = redundant_array;
+
+
+    for(int i = 0 ; i < redundant_array_size ; i++){
+        thread_block_rw[thread->thread] ++;
+        thread_gc_block_rw[thread->thread] ++;
+        rc = spdk_nvme_ns_cmd_read(ns_entry->ns, ns_entry->qpair[qpair_num], (task->buffer + i * BLOCK_SIZE),
+        redundant_array[i] * physical_block_to_logical_block  ,1 *physical_block_to_logical_block , garbadge_collection_cb , task , 0);
+        if (rc != 0) {
+            fprintf(stderr, "ERROR: starting GC read I/O failed\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+    return ;
+}

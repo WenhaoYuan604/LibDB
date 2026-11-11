@@ -1,0 +1,149 @@
+#include "./base.h"
+#include "kv_record.h"
+#include <stdatomic.h>
+#include <time.h>
+
+struct address_type ADDR_NULL = {0,0,0};
+
+atomic_int active_thread_disk = 0;
+int MAX_DISK_CONCURRENT = 1;
+
+#define KV_VERSION_BATCH_SIZE 65536ULL
+
+static atomic_uint_fast64_t g_kv_record_version_next = 0;
+
+static kv_version_type kv_record_clock_seed(void){
+    struct timespec now;
+    if(clock_gettime(CLOCK_REALTIME, &now) != 0){
+        perror("clock_gettime(CLOCK_REALTIME)");
+        abort();
+    }
+    kv_version_type seed =
+        (kv_version_type)now.tv_sec * 1000000000ULL +
+        (kv_version_type)now.tv_nsec;
+    return seed == 0 ? 1 : seed;
+}
+
+static kv_version_type kv_record_reserve_version_batch(void){
+    uint_fast64_t observed = atomic_load_explicit(
+        &g_kv_record_version_next, memory_order_relaxed);
+
+    for(;;){
+        kv_version_type batch_start = (kv_version_type)observed;
+        if(batch_start == 0){
+            batch_start = kv_record_clock_seed();
+        }
+        if(batch_start > UINT64_MAX - KV_VERSION_BATCH_SIZE){
+            fprintf(stderr, "global KV version counter exhausted\n");
+            abort();
+        }
+
+        uint_fast64_t desired =
+            (uint_fast64_t)(batch_start + KV_VERSION_BATCH_SIZE);
+        if(atomic_compare_exchange_weak_explicit(
+                &g_kv_record_version_next, &observed, desired,
+                memory_order_relaxed, memory_order_relaxed)){
+            return batch_start;
+        }
+    }
+}
+
+int kv_record_advance_version(kv_version_type observed){
+    if(observed >= UINT64_MAX - KV_VERSION_BATCH_SIZE) return -1;
+    uint_fast64_t current = atomic_load_explicit(&g_kv_record_version_next, memory_order_relaxed);
+    while(current <= observed && !atomic_compare_exchange_weak_explicit(
+        &g_kv_record_version_next, &current, observed + 1,
+        memory_order_relaxed, memory_order_relaxed)) {}
+    return 0;
+}
+
+kv_version_type kv_record_next_thread_version(
+        kv_version_type *next_version, kv_version_type *version_limit){
+    if(next_version == NULL || version_limit == NULL){
+        fprintf(stderr, "kv_record_next_thread_version: NULL state\n");
+        abort();
+    }
+    if(*next_version > *version_limit){
+        fprintf(stderr, "invalid per-worker KV version range\n");
+        abort();
+    }
+    if(*next_version == *version_limit){
+        *next_version = kv_record_reserve_version_batch();
+        *version_limit = *next_version + KV_VERSION_BATCH_SIZE;
+    }
+    return (*next_version)++;
+}
+
+void access_disk(){
+}
+
+void access_disk_release(){
+}
+
+
+void random_seed_initialize(int thread){
+    random_seed = (unsigned int *)malloc(sizeof(unsigned int) * thread);
+    for(int i = 0 ; i < thread ; i++){
+        random_seed[i] = i;
+    }
+
+	thread_scan_block = (uint64_t *)malloc(sizeof(uint64_t) * thread);
+	memset(thread_scan_block , 0 , sizeof(uint64_t) * thread);
+
+	thread_block_rw = (uint64_t *)malloc(sizeof(uint64_t) * thread);
+	memset(thread_block_rw , 0 , sizeof(uint64_t) * thread);
+
+
+	thread_flush_block_write = (uint64_t *)malloc(sizeof(uint64_t) * thread);
+	memset(thread_flush_block_write , 0 , sizeof(uint64_t) * thread);
+
+	thread_gc_block_rw = (uint64_t *)malloc(sizeof(uint64_t) * thread);
+	memset(thread_gc_block_rw , 0 , sizeof(uint64_t) * thread);
+
+	thread_gc_block_write = (uint64_t *)malloc(sizeof(uint64_t) * thread);
+	memset(thread_gc_block_write , 0 , sizeof(uint64_t) * thread);
+
+
+	thread_split_block_write = (uint64_t *)malloc(sizeof(uint64_t) * thread);
+	memset(thread_split_block_write , 0 , sizeof(uint64_t) * thread);
+
+	invalid_block_num = (uint64_t *)malloc(sizeof(uint64_t) * thread);
+	memset(invalid_block_num , 0 , sizeof(uint64_t) * thread);
+
+	thread_split_block_rw = (uint64_t *)malloc(sizeof(uint64_t) * thread);
+	memset(thread_split_block_rw , 0 , sizeof(uint64_t) * thread);
+
+	thread_kvcache_hit = (uint64_t *)malloc(sizeof(uint64_t) * thread);
+	memset(thread_kvcache_hit , 0 , sizeof(uint64_t) * thread);
+
+	thread_kvbuffer_hit = (uint64_t *)malloc(sizeof(uint64_t) * thread);
+	memset(thread_kvbuffer_hit , 0 , sizeof(uint64_t) * thread);
+
+	thread_scan_total = (uint64_t *)malloc(sizeof(uint64_t) * thread);
+	memset(thread_scan_total , 0 , sizeof(uint64_t) * thread);
+
+	thread_scan_on_block = (uint64_t *)malloc(sizeof(uint64_t) * thread);
+	memset(thread_scan_on_block , 0 , sizeof(uint64_t) * thread);
+
+	thread_completed = (uint64_t *)malloc(sizeof(uint64_t) * thread);
+	memset(thread_completed , 0 , sizeof(uint64_t) * thread);
+
+	insert_breakdown = (struct insert_time_breakdown *)malloc(sizeof(struct insert_time_breakdown) * thread);
+	memset(insert_breakdown , 0 , sizeof(struct insert_time_breakdown) * thread);
+
+	read_breakdown = (struct read_time_breakdown *)malloc(sizeof(struct read_time_breakdown) * thread);
+	memset(read_breakdown , 0 , sizeof(struct read_time_breakdown) * thread);
+
+    return ;
+}
+
+
+
+int random_level(int max , unsigned int * seed)
+{
+    int level = 0;
+    while (level < max && !((rand_r(seed) & 0x3))) {
+        level++;
+    }
+    return level;
+}

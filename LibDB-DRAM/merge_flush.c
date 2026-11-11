@@ -1,0 +1,283 @@
+#include "merge_flush.h"
+#include "insert.h"
+#include "kv_record.h"
+#include "wal.h"
+#include <errno.h>
+
+
+void reclaim_blocks(struct thread *thread, const uint32_t *blocks, size_t count){
+    for(size_t i = 0; i < count; i++){
+        uint32_t block = blocks[i];
+        free_block(&block, 1, &thread->curr_segment, thread->fs);
+    }
+}
+
+struct pending_maintenance {
+    key_type key;
+    struct pending_maintenance *next;
+};
+
+static void request_merge(struct thread *thread, key_type key){
+    for(struct pending_maintenance *p = thread->maintenance; p; p = p->next)
+        if(p->key == key) return;
+    struct pending_maintenance *p = malloc(sizeof(*p));
+    if(!p) abort();
+    *p = (struct pending_maintenance){key, thread->maintenance};
+    thread->maintenance = p;
+}
+
+
+
+static int partition(struct thread *thread, key_type key){
+    int lo = 0, hi = thread->db->boundary_size;
+    key_type *fences = thread->db->boundary[thread->thread];
+    while(lo + 1 < hi){
+        int mid = lo + (hi - lo) / 2;
+        if(fences[mid] <= key) lo = mid;
+        else hi = mid;
+    }
+    return lo;
+}
+
+bool merge_same_partition(struct thread *thread, key_type left, key_type right){
+    return left < right && key_to_thread(left, thread->db) == thread->thread &&
+           key_to_thread(right, thread->db) == thread->thread &&
+           partition(thread, left) == partition(thread, right);
+}
+
+struct merge_plan {
+    struct thread *thread;
+    struct task *task;
+    struct subspace_info *group;
+    uint32_t old_slot_count, slot_count, key_count;
+    uint32_t source_count, dest_count, completed;
+    bool failed;
+    struct index_slot *old_slots[2 * SUBSPACE_MAX_SLOT];
+    struct index_slot logical[SUBSPACE_MAX_SLOT];
+    struct index_slot *shadow[SUBSPACE_MAX_SLOT];
+    struct slot_update updates[2 * SUBSPACE_MAX_SLOT];
+    uint32_t sources[SUBSPACE_MAX_KEY], destinations[SUBSPACE_MAX_KEY];
+    char *packed;
+};
+
+static void merge_fatal(const char *reason){
+    fprintf(stderr, "merge: %s; source blocks retained\n", reason);
+    exit(EXIT_FAILURE);
+}
+
+static void merge_commit(struct merge_plan *plan){
+    struct thread *thread = plan->thread;
+    struct subspace_info *group = plan->group;
+    if(slot_index_apply_updates( plan->updates, plan->old_slot_count) != 0)
+        merge_fatal("DRAM item-index publication failed");
+
+    for(uint32_t i = plan->slot_count; i < plan->old_slot_count; i++)
+        slot_index_free(&thread->slots, plan->old_slots[i]);
+    for(uint32_t i = 0; i < plan->slot_count; i++)
+        for(uint32_t j = 0; j < group->slot_key_num[i]; j++)
+            block_ref_add(plan->updates[i].image.entries[j].addr.block);
+    group->migration_slot_shadow = NULL;
+    group->total_block_num = plan->dest_count;
+    group->redundant_size = 0;
+    group->is_merging = false;
+    reclaim_blocks(thread, plan->sources, plan->source_count);
+    thread->merge_count++;
+    spdk_free(plan->packed);
+    free_task(plan->task);
+    free(plan);
+}
+
+static void merge_write_cb(void *arg, const struct spdk_nvme_cpl *cpl){
+    struct merge_plan *plan = arg;
+    if(spdk_nvme_cpl_is_error(cpl)) plan->failed = true;
+    if(++plan->completed != plan->dest_count) return;
+    if(plan->failed) merge_fatal("SSD write failed");
+    merge_commit(plan);
+}
+
+static void merge_read_cb(void *arg, const struct spdk_nvme_cpl *cpl){
+    struct merge_plan *plan = arg;
+    struct thread *thread = plan->thread;
+    if(spdk_nvme_cpl_is_error(cpl)) plan->failed = true;
+    if(++plan->completed != plan->source_count) return;
+    if(plan->failed) merge_fatal("SSD read failed");
+    size_t offset = 0;
+    for(uint32_t i = 0; i < plan->slot_count; i++){
+        for(uint32_t j = 0; j < plan->group->slot_key_num[i]; j++){
+            struct slot_element *entry = &plan->updates[i].image.entries[j];
+            struct address_type old = entry->addr;
+            uint32_t src = 0;
+            while(src < plan->source_count && plan->sources[src] != old.block) src++;
+            if(src == plan->source_count || old.size > BLOCK_SIZE || old.off + old.size > BLOCK_SIZE)
+                merge_fatal("invalid source address");
+            const char *record = plan->task->buffer + (size_t)src * BLOCK_SIZE + old.off;
+            struct kv_record_view view;
+            if(kv_record_decode_for_key(record, old.size, entry->key, &view) != 0)
+                merge_fatal("invalid source record");
+            if(offset % BLOCK_SIZE + old.size > BLOCK_SIZE) offset += BLOCK_SIZE - offset % BLOCK_SIZE;
+            memcpy(plan->packed + offset, record, old.size);
+            entry->addr.block = plan->destinations[offset / BLOCK_SIZE];
+            entry->addr.off = offset % BLOCK_SIZE;
+            offset += old.size;
+        }
+    }
+    plan->completed = 0;
+    for(uint32_t i = 0; i < plan->dest_count; i++){
+        thread_block_rw[thread->thread]++;
+        thread->merge_write_blocks++;
+        int rc = spdk_nvme_ns_cmd_write(thread->ns_entry->ns,
+            thread->ns_entry->qpair[thread->thread % ctr_max_qp],
+            plan->packed + (size_t)i * BLOCK_SIZE,
+            (uint64_t)plan->destinations[i] * physical_block_to_logical_block,
+            physical_block_to_logical_block, merge_write_cb, plan,
+            0);
+        if(rc) merge_fatal("cannot submit SSD write");
+        phase_io_add(&thread->phase_io, PHASE_MERGE, 1);
+    }
+}
+
+
+static bool merge_start(struct thread *thread, struct subspace_info *left, struct subspace_info *right){
+    struct task *task = get_free_task(thread->ns_entry, thread->thread);
+    if(!task) return false;
+    struct merge_plan *plan = calloc(1, sizeof(*plan));
+    if(!plan){ free_task(task); return false; }
+    plan->thread = thread;
+    plan->task = task;
+    plan->group = left;
+    uint32_t keys = 0;
+    size_t bytes = 0;
+    struct subspace_info *groups[2] = {left, right};
+    for(int g = 0; g < 2; g++){
+        for(uint32_t i = 0; i < groups[g]->slot_num; i++){
+            plan->old_slots[plan->old_slot_count++] = groups[g]->slot[i];
+            struct slot_element *entries = subspace_slot_elements(groups[g], i);
+            for(uint32_t j = 0; j < groups[g]->slot_key_num[i]; j++){
+                if(keys >= SUBSPACE_MAX_KEY || entries[j].addr.size <= 0 ||
+                   entries[j].addr.size > BLOCK_SIZE || entries[j].addr.off < 0 ||
+                   entries[j].addr.off + entries[j].addr.size > BLOCK_SIZE) goto cancel;
+                plan->logical[keys / SLOT_MAX_ELEMENT].entries[keys % SLOT_MAX_ELEMENT] = entries[j];
+                keys++;
+                uint32_t b = entries[j].addr.block, k = 0;
+                while(k < plan->source_count && plan->sources[k] != b) k++;
+                if(k == plan->source_count) plan->sources[plan->source_count++] = b;
+                if(bytes % BLOCK_SIZE + entries[j].addr.size > BLOCK_SIZE) bytes += BLOCK_SIZE - bytes % BLOCK_SIZE;
+                bytes += entries[j].addr.size;
+            }
+        }
+    }
+    plan->key_count = keys;
+    plan->slot_count = (keys + SLOT_MAX_ELEMENT - 1) / SLOT_MAX_ELEMENT;
+    plan->dest_count = (bytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    if(plan->source_count > LIBDB_TASK_BUFFER_BLOCK_COUNT || plan->dest_count > LIBDB_TASK_BUFFER_BLOCK_COUNT) goto cancel;
+
+    if(plan->dest_count){
+        plan->packed = spdk_zmalloc((size_t)plan->dest_count * BLOCK_SIZE, BLOCK_SIZE, NULL,
+                                   SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+        if(!plan->packed) goto cancel;
+    }
+    for(uint32_t i = 0; i < plan->dest_count; i++){
+        int block = get_free_block(&thread->curr_segment, thread->fs);
+        if(block < 0){
+            reclaim_blocks(thread, plan->destinations, i);
+            goto cancel;
+        }
+        plan->destinations[i] = block;
+    }
+    for(uint32_t i = 0; i < plan->old_slot_count; i++){
+        plan->updates[i].slot = plan->old_slots[i];
+        if(i < plan->slot_count){
+            plan->logical[i].boundary = left->boundary;
+            plan->updates[i].image = plan->logical[i];
+            plan->shadow[i] = &plan->logical[i];
+        }
+    }
+    left->is_merging = right->is_merging = true;
+    write_buffer_index_merge(left->buffer_index, right->buffer_index);
+    write_buffer_index_destroy(right->buffer_index);
+    right->buffer_index = NULL;
+    kvcache_merge(left->kvcache, right->kvcache);
+    kvcache_destroy_empty(right->kvcache);
+    right->kvcache = NULL;
+    left->buffered_size += right->buffered_size;
+    left->total_block_num += right->total_block_num;
+    left->redundant_size += right->redundant_size;
+    left->key_num = keys;
+    left->slot_num = plan->slot_count;
+    memset(left->slot, 0, sizeof(left->slot));
+    memset(left->slot_key_num, 0, sizeof(left->slot_key_num));
+    memset(left->min_key, 0, sizeof(left->min_key));
+    for(uint32_t i = 0; i < plan->slot_count; i++){
+        left->slot[i] = plan->old_slots[i];
+        left->slot_key_num[i] = keys - i * SLOT_MAX_ELEMENT < SLOT_MAX_ELEMENT ? keys - i * SLOT_MAX_ELEMENT : SLOT_MAX_ELEMENT;
+        left->min_key[i] = plan->logical[i].entries[0].key;
+    }
+    left->migration_slot_shadow = plan->shadow;
+    if(!dram_index_remove(thread->index->dram_index, right->boundary)) abort();
+    thread_subspaces[thread->thread]--;
+    subspace_ref(right);
+    subspace_ref(left);
+    right->slot_num = 0;
+    memset(right->slot, 0, sizeof(right->slot));
+    right->redirect = left;
+    subspace_unref(right);
+    if(!plan->source_count){ merge_commit(plan); return true; }
+    for(uint32_t i = 0; i < plan->source_count; i++){
+        thread_block_rw[thread->thread]++;
+        thread->merge_read_blocks++;
+        int rc = spdk_nvme_ns_cmd_read(thread->ns_entry->ns,
+            thread->ns_entry->qpair[thread->thread % ctr_max_qp],
+            task->buffer + (size_t)i * BLOCK_SIZE,
+            (uint64_t)plan->sources[i] * physical_block_to_logical_block,
+            physical_block_to_logical_block, merge_read_cb, plan, 0);
+        if(rc) merge_fatal("cannot submit SSD read");
+    }
+    return true;
+cancel:
+    spdk_free(plan->packed);
+    free(plan);
+    free_task(task);
+    return false;
+}
+
+
+static bool merge_try(struct thread *thread, key_type key){
+    struct subspace_info *group = dram_index_search(thread->index->dram_index, key, NULL, NULL);
+    if(!group) return true;
+    if(subspace_busy(group)) return false;
+    struct subspace_info *best = NULL;
+    uint32_t best_sum = UINT32_MAX, count = subspace_live_keys(group);
+    bool busy_neighbor = false;
+    for(int direction = -1; direction <= 1; direction += 2){
+        struct subspace_info *other = dram_index_neighbor(thread->index->dram_index, group->boundary, direction);
+        if(!other) continue;
+        key_type left = direction < 0 ? other->boundary : group->boundary;
+        key_type right = direction < 0 ? group->boundary : other->boundary;
+        if(!merge_same_partition(thread, left, right)) continue;
+        if(subspace_busy(other)){ busy_neighbor = true; continue; }
+        uint32_t n = subspace_live_keys(other);
+        if(count >= LIBDB_SUBSPACE_MERGE_LOWER_THRESHOLD && n >= LIBDB_SUBSPACE_MERGE_LOWER_THRESHOLD) continue;
+        uint64_t sum = (uint64_t)count + n;
+        if(sum <= SUBSPACE_MAX_KEY && sum < best_sum){ best = other; best_sum = sum; }
+    }
+    if(!best) return !busy_neighbor;
+    return best->boundary < group->boundary ? merge_start(thread, best, group) : merge_start(thread, group, best);
+}
+
+void merge_check_after_delete(struct thread *thread, key_type key){
+    if(!merge_try(thread, key)) request_merge(thread, key);
+}
+
+void maintenance_poll(struct thread *thread){
+    if(thread->servicing_maintenance) return;
+    thread->servicing_maintenance = true;
+    struct pending_maintenance *batch = thread->maintenance;
+    thread->maintenance = NULL;
+    while(batch){
+        struct pending_maintenance *p = batch;
+        batch = p->next;
+        if(!merge_try(thread, p->key)) request_merge(thread, p->key);
+        free(p);
+    }
+    thread->servicing_maintenance = false;
+}

@@ -1,0 +1,108 @@
+pci: 0000:5c:00.0 pmem: /mnt/whypmem/libdb_ycsba_space_amplification_En0Bk0SJpl/01_sa1.4_uniform_gc_light_A warm: /mnt/nvme0n1/why/ycsb_workloads_one_warm/uniform/warm.txt test: /mnt/nvme0n1/why/ycsb_workloads_one_warm/uniform/ycsba.txt
+参数配置：
+thread=16
+kvsize=1024
+kvs=100000000
+cachesize=20480MB
+Benchmark phase: begin load
+thread 0 : consume 22656MB
+thread 1 : consume 22653MB
+thread 2 : consume 22660MB
+thread 3 : consume 22660MB
+thread 4 : consume 22653MB
+thread 5 : consume 22620MB
+thread 6 : consume 22624MB
+thread 7 : consume 22628MB
+thread 8 : consume 22628MB
+thread 9 : consume 22634MB
+thread 10 : consume 22620MB
+thread 11 : consume 22625MB
+thread 12 : consume 22632MB
+thread 13 : consume 22623MB
+thread 14 : consume 22623MB
+thread 15 : consume 22626MB
+total bandwidth consumed : block 88421276 consume 345395MB
+GC total consumed: block 0 consume 0MB
+GC write consumed: block 0 consume 0MB
+Split total consumed: block 65243264 consume 254856MB
+Split write consumed: block 32621632 consume 127428MB
+Merge completed: 0; read blocks: 0; write blocks: 0
+total : WBF 16GB  LNF 0GB
+total consumed SSD spaces : 0GB
+total consumed SSD spaces : 88GB total_flush_block is 23178012
+total invalid SSD spaces : 0GB
+total : kvcache hit 0, write buffer hit 0
+scan : scan 0 keys on block 0 read 0 block
+WA is 228555341824 / 102400000000 = 2.231986 (bytes/bytes)
+test:total 100000000 ops Insert 100000000 Update 0 Get 0 Scan 0 time 226.900911s
+Benchmark phase: end load
+Benchmark phase: begin warmup
+thread 0 : consume 10949MB
+thread 1 : consume 10939MB
+thread 2 : consume 10938MB
+thread 3 : consume 10946MB
+thread 4 : consume 10939MB
+thread 5 : consume 10929MB
+thread 6 : consume 10926MB
+thread 7 : consume 10929MB
+thread 8 : consume 10935MB
+thread 9 : consume 10929MB
+thread 10 : consume 10933MB
+thread 11 : consume 10931MB
+thread 12 : consume 10924MB
+thread 13 : consume 10926MB
+thread 14 : consume 10931MB
+thread 15 : consume 10936MB
+total bandwidth consumed : block 42712048 consume 166843MB
+GC total consumed: block 0 consume 0MB
+GC write consumed: block 0 consume 0MB
+Split total consumed: block 0 consume 0MB
+Split write consumed: block 0 consume 0MB
+Merge completed: 0; read blocks: 0; write blocks: 0
+total : WBF 16GB  LNF 0GB
+total consumed SSD spaces : 0GB
+total consumed SSD spaces : 88GB total_flush_block is 0
+total invalid SSD spaces : 0GB
+total : kvcache hit 0, write buffer hit 7287952
+scan : scan 0 keys on block 0 read 0 block
+WA is 0 / 0 = N/A (bytes/bytes; no logical writes)
+test:total 50000000 ops Insert 100000000 Update 0 Get 0 Scan 0 time 84.556844s
+Benchmark phase: end warmup
+Benchmark phase: begin measured
+SSD window: {"phase":"measured","requests":100000000,"inserts":0,"updates":50011770,"reads":49988230,"scans":0,"kv_size_bytes":1024,"seconds":92.027911110,"flush_bytes":37892870144,"gc_bytes":151388160,"split_bytes":0,"merge_bytes":0}
+thread 0 : consume 10957MB
+thread 1 : consume 10968MB
+thread 2 : consume 10970MB
+thread 3 : consume 10964MB
+thread 4 : consume 10956MB
+thread 5 : consume 10968MB
+thread 6 : consume 10950MB
+thread 7 : consume 10945MB
+thread 8 : consume 10949MB
+thread 9 : consume 10946MB
+thread 10 : consume 10942MB
+thread 11 : consume 10954MB
+thread 12 : consume 10951MB
+thread 13 : consume 10951MB
+thread 14 : consume 10959MB
+thread 15 : consume 10956MB
+total bandwidth consumed : block 42796539 consume 167173MB
+GC total consumed: block 128850 consume 503MB
+GC write consumed: block 36960 consume 144MB
+Split total consumed: block 0 consume 0MB
+Split write consumed: block 0 consume 0MB
+Merge completed: 0; read blocks: 0; write blocks: 0
+total : WBF 16GB  LNF 0GB
+total consumed SSD spaces : 3GB
+total consumed SSD spaces : 123GB total_flush_block is 9251192
+total invalid SSD spaces : 0GB
+total : kvcache hit 9876310, write buffer hit 6695423
+scan : scan 0 keys on block 0 read 0 block
+WA is 38044270592 / 51212052480 = 0.742877 (bytes/bytes)
+test:total 100000000 ops Insert 0 Update 50011770 Get 49988230 Scan 0 time 92.027911s
+Benchmark phase: end measured
+SSD space: exclude_wal=1 force_flush=0 denominator=initial_load_input occupancy=gmap_nonzero
+initial_load_record_bytes=102400000000
+ssd_data_used_blocks=32120581 ssd_data_used_bytes=131565899776
+ssd_space_amplification=1.284823240
+ssd_online_used_blocks=32120581 online_counter_matches_snapshot=1

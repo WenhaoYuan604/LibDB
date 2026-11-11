@@ -1,0 +1,108 @@
+pci: 0000:5c:00.0 pmem: /mnt/whypmem/libdb_ycsb_ae_kvsize_gWTTz1H4TX/03_kv512_uniform_A warm: /mnt/nvme0n1/why/ycsb_workloads_one_warm/uniform/warm.txt test: /mnt/nvme0n1/why/ycsb_workloads_one_warm/uniform/ycsba.txt
+参数配置：
+thread=16
+kvsize=512
+kvs=100000000
+cachesize=10240MB
+Benchmark phase: begin load
+thread 0 : consume 11333MB
+thread 1 : consume 11339MB
+thread 2 : consume 11337MB
+thread 3 : consume 11345MB
+thread 4 : consume 11331MB
+thread 5 : consume 11321MB
+thread 6 : consume 11312MB
+thread 7 : consume 11323MB
+thread 8 : consume 11314MB
+thread 9 : consume 11331MB
+thread 10 : consume 11318MB
+thread 11 : consume 11312MB
+thread 12 : consume 11314MB
+thread 13 : consume 11328MB
+thread 14 : consume 11314MB
+thread 15 : consume 11316MB
+total bandwidth consumed : block 44236756 consume 172799MB
+GC total consumed: block 0 consume 0MB
+GC write consumed: block 0 consume 0MB
+Split total consumed: block 32648160 consume 127531MB
+Split write consumed: block 16324080 consume 63765MB
+Merge completed: 0; read blocks: 0; write blocks: 0
+total : WBF 8GB  LNF 0GB
+total consumed SSD spaces : 0GB
+total consumed SSD spaces : 44GB total_flush_block is 11588596
+total invalid SSD spaces : 0GB
+total : kvcache hit 0, write buffer hit 0
+scan : scan 0 keys on block 0 read 0 block
+WA is 114330320896 / 51200000000 = 2.233014 (bytes/bytes)
+test:total 100000000 ops Insert 100000000 Update 0 Get 0 Scan 0 time 116.252616s
+Benchmark phase: end load
+Benchmark phase: begin warmup
+thread 0 : consume 10946MB
+thread 1 : consume 10939MB
+thread 2 : consume 10941MB
+thread 3 : consume 10934MB
+thread 4 : consume 10939MB
+thread 5 : consume 10941MB
+thread 6 : consume 10926MB
+thread 7 : consume 10936MB
+thread 8 : consume 10925MB
+thread 9 : consume 10927MB
+thread 10 : consume 10929MB
+thread 11 : consume 10929MB
+thread 12 : consume 10920MB
+thread 13 : consume 10932MB
+thread 14 : consume 10931MB
+thread 15 : consume 10932MB
+total bandwidth consumed : block 42708768 consume 166831MB
+GC total consumed: block 0 consume 0MB
+GC write consumed: block 0 consume 0MB
+Split total consumed: block 0 consume 0MB
+Split write consumed: block 0 consume 0MB
+Merge completed: 0; read blocks: 0; write blocks: 0
+total : WBF 8GB  LNF 0GB
+total consumed SSD spaces : 0GB
+total consumed SSD spaces : 44GB total_flush_block is 0
+total invalid SSD spaces : 0GB
+total : kvcache hit 0, write buffer hit 7291232
+scan : scan 0 keys on block 0 read 0 block
+WA is 0 / 0 = N/A (bytes/bytes; no logical writes)
+test:total 50000000 ops Insert 100000000 Update 0 Get 0 Scan 0 time 73.619995s
+Benchmark phase: end warmup
+Benchmark phase: begin measured
+SSD window: {"phase":"measured","requests":100000000,"inserts":0,"updates":50011770,"reads":49988230,"scans":0,"kv_size_bytes":512,"seconds":75.367996239,"flush_bytes":19281068032,"gc_bytes":1550741504,"split_bytes":0,"merge_bytes":0}
+thread 0 : consume 10008MB
+thread 1 : consume 10005MB
+thread 2 : consume 10007MB
+thread 3 : consume 10017MB
+thread 4 : consume 10002MB
+thread 5 : consume 10009MB
+thread 6 : consume 9996MB
+thread 7 : consume 9987MB
+thread 8 : consume 10001MB
+thread 9 : consume 9989MB
+thread 10 : consume 9993MB
+thread 11 : consume 10007MB
+thread 12 : consume 10002MB
+thread 13 : consume 9992MB
+thread 14 : consume 10006MB
+thread 15 : consume 9997MB
+total bandwidth consumed : block 39068574 consume 152611MB
+GC total consumed: block 1045738 consume 4084MB
+GC write consumed: block 378604 consume 1478MB
+Split total consumed: block 0 consume 0MB
+Split write consumed: block 0 consume 0MB
+Merge completed: 0; read blocks: 0; write blocks: 0
+total : WBF 8GB  LNF 0GB
+total consumed SSD spaces : 1GB
+total consumed SSD spaces : 61GB total_flush_block is 4707292
+total invalid SSD spaces : 0GB
+total : kvcache hit 10089419, write buffer hit 6583267
+scan : scan 0 keys on block 0 read 0 block
+WA is 20831830016 / 25606026240 = 0.813552 (bytes/bytes)
+test:total 100000000 ops Insert 0 Update 50011770 Get 49988230 Scan 0 time 75.367996s
+Benchmark phase: end measured
+SSD space: exclude_wal=1 force_flush=0 denominator=initial_load_input occupancy=gmap_nonzero
+initial_load_record_bytes=51200000000
+ssd_data_used_blocks=16005268 ssd_data_used_bytes=65557577728
+ssd_space_amplification=1.280421440
+ssd_online_used_blocks=16005268 online_counter_matches_snapshot=1

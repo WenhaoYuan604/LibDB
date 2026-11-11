@@ -1,0 +1,171 @@
+Result: round=1 distribution=uniform workload=YCSB_A experiment=GC-heavy space_amplification_target=1.4
+WA scope: data-only SSD writes (excluding WAL); PHASE_WA retains data, WAL, and total write amplification.
+Benchmark phase: begin load
+PHASE_IO version=1 phase=load requests=100000000 logical_bytes=102400000000 flush_blocks=23175340 split_blocks=32639936 gc_blocks=0 merge_blocks=0 wal_bytes=104973975552 scan_ssd_keys=0 scan_read_blocks=0 block_bytes=4096 boundary=requests_complete drain=0 force_flush=0
+PHASE_WA version=1 phase=load requests=100000000 logical_bytes=102400000000 data_write_bytes=228619370496 wal_bytes=104973975552 total_write_bytes=333593346048 wa_data=2.232611040 wa_wal=1.025136480 wa_total=3.257747520 boundary=requests_complete drain=0 force_flush=0
+thread 0 : consume 22630MB
+thread 1 : consume 22662MB
+thread 2 : consume 22686MB
+thread 3 : consume 22670MB
+thread 4 : consume 22653MB
+thread 5 : consume 22618MB
+thread 6 : consume 22633MB
+thread 7 : consume 22641MB
+thread 8 : consume 22642MB
+thread 9 : consume 22640MB
+thread 10 : consume 22636MB
+thread 11 : consume 22617MB
+thread 12 : consume 22629MB
+thread 13 : consume 22676MB
+thread 14 : consume 22646MB
+thread 15 : consume 22625MB
+total bandwidth consumed : block 88455212 consume 345528MB
+GC total consumed: block 0 consume 0MB
+GC write consumed: block 0 consume 0MB
+Split total consumed: block 65279872 consume 254999MB
+Split write consumed: block 32639936 consume 127499MB
+Merge completed: 0; read blocks: 0; write blocks: 0
+total consumed SSD spaces : 88GB
+total consumed SSD spaces : 88GB total_flush_block is 23175340
+total invalid SSD spaces : 0GB
+total : kvcache hit 0, write buffer hit 0
+scan : scan 0 keys on block 0 read 0 block
+WA is 228619370496 / 102400000000 = 2.232611 (bytes/bytes)
+test:total 100000000 ops Insert 100000000 Update 0 Get 0 Scan 0 time 237.554301s
+Benchmark phase: end load
+Benchmark phase: begin warmup
+PHASE_IO version=1 phase=warmup requests=50000000 logical_bytes=0 flush_blocks=0 split_blocks=0 gc_blocks=0 merge_blocks=0 wal_bytes=0 scan_ssd_keys=0 scan_read_blocks=0 block_bytes=4096 boundary=requests_complete drain=0 force_flush=0
+PHASE_WA version=1 phase=warmup requests=50000000 logical_bytes=0 data_write_bytes=0 wal_bytes=0 total_write_bytes=0 wa_data=N/A wa_wal=N/A wa_total=N/A boundary=requests_complete drain=0 force_flush=0
+thread 0 : consume 10935MB
+thread 1 : consume 10929MB
+thread 2 : consume 10932MB
+thread 3 : consume 10941MB
+thread 4 : consume 10944MB
+thread 5 : consume 10944MB
+thread 6 : consume 10928MB
+thread 7 : consume 10924MB
+thread 8 : consume 10928MB
+thread 9 : consume 10923MB
+thread 10 : consume 10931MB
+thread 11 : consume 10927MB
+thread 12 : consume 10925MB
+thread 13 : consume 10924MB
+thread 14 : consume 10931MB
+thread 15 : consume 10931MB
+total bandwidth consumed : block 42701360 consume 166802MB
+GC total consumed: block 0 consume 0MB
+GC write consumed: block 0 consume 0MB
+Split total consumed: block 0 consume 0MB
+Split write consumed: block 0 consume 0MB
+Merge completed: 0; read blocks: 0; write blocks: 0
+total consumed SSD spaces : 88GB
+total consumed SSD spaces : 88GB total_flush_block is 0
+total invalid SSD spaces : 0GB
+total : kvcache hit 0, write buffer hit 7298640
+scan : scan 0 keys on block 0 read 0 block
+WA is 0 / 0 = N/A (bytes/bytes; no logical writes)
+test:total 50000000 ops Insert 100000000 Update 0 Get 0 Scan 0 time 74.352450s
+Benchmark phase: end warmup
+Benchmark phase: begin precondition
+PHASE_IO version=1 phase=A requests=150000000 logical_bytes=76796080128 flush_blocks=14389326 split_blocks=0 gc_blocks=2839572 merge_blocks=0 wal_bytes=93903368192 scan_ssd_keys=0 scan_read_blocks=0 block_bytes=4096 boundary=requests_complete drain=0 force_flush=0
+PHASE_WA version=1 phase=A requests=150000000 logical_bytes=76796080128 data_write_bytes=70569566208 wal_bytes=93903368192 total_write_bytes=164472934400 wa_data=0.918921462 wa_wal=1.222762516 wa_total=2.141683978 boundary=requests_complete drain=0 force_flush=0
+thread 0 : consume 19700MB
+thread 1 : consume 19710MB
+thread 2 : consume 19681MB
+thread 3 : consume 19705MB
+thread 4 : consume 19731MB
+thread 5 : consume 19725MB
+thread 6 : consume 19679MB
+thread 7 : consume 19667MB
+thread 8 : consume 19677MB
+thread 9 : consume 19689MB
+thread 10 : consume 19671MB
+thread 11 : consume 19711MB
+thread 12 : consume 19672MB
+thread 13 : consume 19675MB
+thread 14 : consume 19707MB
+thread 15 : consume 19688MB
+total bandwidth consumed : block 76927737 consume 300498MB
+GC total consumed: block 9982926 consume 38995MB
+GC write consumed: block 2839572 consume 11092MB
+Split total consumed: block 0 consume 0MB
+Split write consumed: block 0 consume 0MB
+Merge completed: 0; read blocks: 0; write blocks: 0
+total consumed SSD spaces : 129GB
+total consumed SSD spaces : 126GB total_flush_block is 14389326
+total invalid SSD spaces : 2GB
+total : kvcache hit 11923447, write buffer hit 10524896
+scan : scan 0 keys on block 0 read 0 block
+WA is 70569566208 / 76796080128 = 0.918921 (bytes/bytes)
+test:total 150000000 ops Insert 0 Update 74996172 Get 75003828 Scan 0 time 199.005247s
+Benchmark phase: end precondition
+Benchmark phase: begin measured
+PHASE_IO version=1 phase=E requests=100000000 logical_bytes=51193706496 flush_blocks=10767717 split_blocks=0 gc_blocks=5927611 merge_blocks=0 wal_bytes=62773342208 scan_ssd_keys=0 scan_read_blocks=0 block_bytes=4096 boundary=requests_complete drain=0 force_flush=0
+PHASE_WA version=1 phase=E requests=100000000 logical_bytes=51193706496 data_write_bytes=68384063488 wal_bytes=62773342208 total_write_bytes=131157405696 wa_data=1.335790435 wa_wal=1.226192564 wa_total=2.561982999 boundary=requests_complete drain=0 force_flush=0
+thread 0 : consume 17129MB
+thread 1 : consume 17152MB
+thread 2 : consume 17139MB
+thread 3 : consume 17143MB
+thread 4 : consume 17130MB
+thread 5 : consume 17119MB
+thread 6 : consume 17140MB
+thread 7 : consume 17135MB
+thread 8 : consume 17136MB
+thread 9 : consume 17112MB
+thread 10 : consume 17109MB
+thread 11 : consume 17098MB
+thread 12 : consume 17151MB
+thread 13 : consume 17126MB
+thread 14 : consume 17116MB
+thread 15 : consume 17122MB
+total bandwidth consumed : block 66910323 consume 261368MB
+GC total consumed: block 21238957 consume 82964MB
+GC write consumed: block 5927611 consume 23154MB
+Split total consumed: block 0 consume 0MB
+Split write consumed: block 0 consume 0MB
+Merge completed: 0; read blocks: 0; write blocks: 0
+total consumed SSD spaces : 132GB
+total consumed SSD spaces : 132GB total_flush_block is 10767717
+total invalid SSD spaces : 9GB
+total : kvcache hit 7893263, write buffer hit 7209234
+scan : scan 0 keys on block 0 read 0 block
+WA is 68384063488 / 51193706496 = 1.335790 (bytes/bytes)
+test:total 100000000 ops Insert 0 Update 49993854 Get 50006146 Scan 0 time 189.887964s
+Benchmark phase: end measured
+SSD space: exclude_wal=1 force_flush=0 denominator=initial_load_input occupancy=gmap_nonzero
+initial_load_record_bytes=102400000000
+ssd_data_used_blocks=31805848 ssd_data_used_bytes=130276753408
+ssd_space_amplification=1.272233920
+ssd_online_used_blocks=31805848 online_counter_matches_snapshot=1
+WAL worker 0: records=14070944 batches=823485 bytes=16363585536 avg_records=17.09 reclaimed=1895 occupied=2046 wait_us=0.00 pressure_flushes=2458
+WAL concurrency worker 0: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=185529589.90 submit_retries=0 scope=process
+WAL worker 1: records=14076086 batches=822891 bytes=16365445120 avg_records=17.11 reclaimed=1896 occupied=2046 wait_us=0.00 pressure_flushes=2392
+WAL concurrency worker 1: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=186850509.29 submit_retries=0 scope=process
+WAL worker 2: records=14071801 batches=822430 bytes=16361295872 avg_records=17.11 reclaimed=1894 occupied=2046 wait_us=0.00 pressure_flushes=2399
+WAL concurrency worker 2: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=186891781.02 submit_retries=0 scope=process
+WAL worker 3: records=14069692 batches=823590 bytes=16362446848 avg_records=17.08 reclaimed=1895 occupied=2046 wait_us=0.00 pressure_flushes=2399
+WAL concurrency worker 3: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=187755709.03 submit_retries=0 scope=process
+WAL worker 4: records=14070173 batches=824094 bytes=16362758144 avg_records=17.07 reclaimed=1895 occupied=2046 wait_us=0.00 pressure_flushes=2364
+WAL concurrency worker 4: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=186413323.47 submit_retries=0 scope=process
+WAL worker 5: records=14061744 batches=824641 bytes=16355254272 avg_records=17.05 reclaimed=1893 occupied=2046 wait_us=0.00 pressure_flushes=2358
+WAL concurrency worker 5: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=187035090.77 submit_retries=0 scope=process
+WAL worker 6: records=14058508 batches=823628 bytes=16349024256 avg_records=17.07 reclaimed=1892 occupied=2046 wait_us=0.00 pressure_flushes=2443
+WAL concurrency worker 6: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=184039194.12 submit_retries=0 scope=process
+WAL worker 7: records=14055419 batches=823205 bytes=16344920064 avg_records=17.07 reclaimed=1891 occupied=2046 wait_us=0.00 pressure_flushes=2474
+WAL concurrency worker 7: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=185397421.77 submit_retries=0 scope=process
+WAL worker 8: records=14054589 batches=822268 bytes=16342953984 avg_records=17.09 reclaimed=1891 occupied=2045 wait_us=0.00 pressure_flushes=2421
+WAL concurrency worker 8: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=183503488.80 submit_retries=0 scope=process
+WAL worker 9: records=14055515 batches=822689 bytes=16347181056 avg_records=17.08 reclaimed=1891 occupied=2046 wait_us=0.00 pressure_flushes=2324
+WAL concurrency worker 9: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=185165629.05 submit_retries=0 scope=process
+WAL worker 10: records=14051474 batches=823831 bytes=16343924736 avg_records=17.06 reclaimed=1891 occupied=2046 wait_us=0.00 pressure_flushes=2374
+WAL concurrency worker 10: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=184446837.57 submit_retries=0 scope=process
+WAL worker 11: records=14058715 batches=824730 bytes=16354422784 avg_records=17.05 reclaimed=1893 occupied=2046 wait_us=0.00 pressure_flushes=2299
+WAL concurrency worker 11: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=185010771.10 submit_retries=0 scope=process
+WAL worker 12: records=14061114 batches=822999 bytes=16350928896 avg_records=17.09 reclaimed=1893 occupied=2046 wait_us=0.00 pressure_flushes=2353
+WAL concurrency worker 12: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=185359292.06 submit_retries=0 scope=process
+WAL worker 13: records=14060607 batches=821534 bytes=16345653248 avg_records=17.12 reclaimed=1891 occupied=2046 wait_us=0.00 pressure_flushes=2418
+WAL concurrency worker 13: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=187030967.33 submit_retries=0 scope=process
+WAL worker 14: records=14058529 batches=823731 bytes=16351072256 avg_records=17.07 reclaimed=1892 occupied=2046 wait_us=0.00 pressure_flushes=2322
+WAL concurrency worker 14: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=185737365.87 submit_retries=0 scope=process
+WAL worker 15: records=14055116 batches=823525 bytes=16349818880 avg_records=17.07 reclaimed=1892 occupied=2046 wait_us=0.00 pressure_flushes=2349
+WAL concurrency worker 15: peak_inflight=2 peak_outstanding=2 peak_completed_waiting=1 credit_wait_us=184284655.07 submit_retries=0 scope=process

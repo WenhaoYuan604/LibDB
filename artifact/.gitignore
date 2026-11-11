@@ -1,0 +1,3 @@
+# Generated YCSB traces and temporary data
+ycsb/generated/
+ycsb/ycsb-data/
